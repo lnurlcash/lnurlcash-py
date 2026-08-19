@@ -155,8 +155,8 @@ The reference implementations, both dni's, both MIT:
 - [lnurl-mint](https://github.com/dni/lnurl-mint) — the reference service
 - [lnurl-wallet](https://github.com/dni/lnurl-wallet) — the reference wallet
 
-This library is an independent Python implementation of the same protocol,
-checked against the same
+This library is a Python implementation of the same protocol, following that
+wallet's protocol layer and checked against the same
 [conformance vectors](https://github.com/TheCryptoDonkey/lnurlcash-conformance)
 as its TypeScript, Rust and Go siblings — and against the same adversarial
 mock mint, which can be told to drop a connection mid-mutation, sign in the
