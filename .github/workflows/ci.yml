@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.10', '3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # the mock mint is a Node process from the conformance repo, and the
+      # vectors come from there too
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/checkout@v4
+        with:
+          repository: TheCryptoDonkey/lnurlcash-conformance
+          path: conformance
+      - run: pip install -e '.[dev]'
+      - run: pip install --upgrade build && python -m build
+      - run: pytest -q
+        env:
+          LNURLCASH_CONFORMANCE: ${{ github.workspace }}/conformance

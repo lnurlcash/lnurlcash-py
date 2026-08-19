@@ -1,0 +1,70 @@
+# lnurlcash-kit (Python)
+
+LNURLcash (LUD-25) bearer note client for Python 3.10+. MIT.
+
+pip install lnurlcash-kit
+
+## What this is
+
+LNURLcash notes are LUD-03 withdrawRequest links whose k1 IS the asset:
+lnurlw://mint.example/w?k1=<32-byte-hex>&amount=<msat>. Whoever knows the k1
+can spend it. Amounts are ALWAYS integer milli-satoshis.
+
+Draft spec: https://github.com/lnurl/luds/pull/301
+Reference mint: https://github.com/dni/lnurl-mint
+
+## Core API
+
+from lnurlcash_kit import LnurlcashClient, AsyncLnurlcashClient
+
+client = LnurlcashClient(timeout=30.0, offline=False, rng=generate_note_secret)
+
+client.fetch_note_info(url) -> WithdrawRequestInfo(callback, k1, max_withdrawable, mint_pubkey)
+client.rotate_note(callback, k1) -> RotateResult(k1, signature)
+client.split_note(callback, k1s, amount_msat) -> SplitResult(k1, change, signature, change_signature)
+client.merge_notes(callback, k1s) -> RotateResult
+client.melt_note(callback, k1, bolt11) -> MeltResult(pr, verify)
+client.settle_note(base_url, k1, expected_msat, sig) -> (k1, amount_msat, sig, callback)
+client.probe_burned_note(url) -> 'live' | 'gone' | 'unknown'
+client.fetch_pay_request(url) / request_invoice(cb, msat) / fetch_invoice_verification(url)
+client.fetch_mint_address(url)
+
+verify_note_signature(k1, amount_msat, sig_hex, mint_pubkey_hex) -> bool
+resolve_note_input(text) / resolve_mint_input(text) / resolve_lnurl_input(text)
+parse_mint_fee(metadata) / apply_mint_fee(gross, fee) / gross_up_for_mint_fee(net, fee)
+
+AsyncLnurlcashClient has the identical surface with await.
+
+For a different HTTP stack use lnurlcash_kit.protocol directly: each function
+returns Request(url, parse, new_secrets) and performs no I/O.
+
+## Rules an implementation MUST follow
+
+1. max_withdrawable from fetch_note_info is the ONLY authoritative value. The
+   `amount` in a note URL is an unverified claim.
+2. On rotate/split/merge the WALLET generates the replacement secret and
+   discloses only sha256(secret). Never accept a service-supplied k1.
+3. Catch AmbiguousMutation, PERSIST err.new_secrets before anything else, then
+   call probe_burned_note. Treating it as failure destroys money the service
+   may already have minted.
+4. RequestRefused means nothing was sent - safe to treat as a no-op.
+5. A melt's OK means IN FLIGHT, not spent. NotePending means retry, not spent.
+6. Rotate immediately after claiming a minted note: the mint generated that
+   preimage, and LUD-21 verify exposes it to anyone who saw the invoice.
+7. Never log note URLs. The secret is in the query string.
+8. Never branch on exception message text. Branch on the class.
+
+## Errors
+
+RequestRefused     nothing sent, note untouched
+ServiceRejected    processed and refused (definitive)
+  NotePending      a melt is in flight on this k1 - retry
+  NoteSpent        authoritative: already burned
+  NoteUnknown      service does not recognise it
+AmbiguousMint      outcome UNKNOWN - assume nothing
+  AmbiguousMutation  carries .new_secrets - persist them
+ProtocolError      a non-mutating response did not match the spec
+
+## Conformance
+
+https://github.com/TheCryptoDonkey/lnurlcash-conformance
