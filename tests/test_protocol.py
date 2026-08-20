@@ -330,6 +330,16 @@ def test_finds_the_experimental_mint_address(mint, client):
     assert address.pay_link.endswith("/.well-known/lnurlp/mint")
 
 
+def test_reads_the_node_stats_a_mint_address_advertises(mint, client):
+    m = mint()
+    address = client.fetch_mint_address(f"{m.url}/.well-known/lnurlw/mint")
+    # the wire field is nodeCapacity - renamed here, so it only arrives if it
+    # is mapped rather than passed through under its own name
+    assert address.node_capacity_msat == 500_000_000
+    assert address.node_num_channels == 4
+    assert address.node_num_peers == 6
+
+
 def test_a_sunsetting_mint_refuses_definitively(mint, client):
     m = mint(sunset=True)
     pay = client.fetch_pay_request(f"{m.url}/.well-known/lnurlp/mint")

@@ -13,6 +13,18 @@ and the adversarial mock mint.
 
 ### Design notes
 
+**The mint address carries the node stats under their wire names.** lnurl-mint
+advertises `nodeCapacity` in msat, so `node_capacity_msat` is a rename and is
+mapped explicitly — the TypeScript sibling shipped that rename unmapped and
+read `None` for every mint.
+
+**`parse_mint_fee` refuses a component past 2^53**, which Python alone would
+carry exactly. A fee has to mean the same thing in every implementation, and
+the shared vectors refuse it, so accepting it here would make this the odd one
+out rather than the generous one.
+
+
+
 **The protocol has no I/O in it.** `lnurlcash_kit.protocol` describes each
 operation as a `Request` — a URL, a parser, and the fresh secrets that must
 survive a lost answer. The sync and async clients do nothing but perform the

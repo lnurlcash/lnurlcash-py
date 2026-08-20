@@ -66,6 +66,11 @@ class MintAddressInfo:
     node_alias: str | None = None
     node_uri: str | None = None
     node_color: str | None = None
+    #: the wire field is ``nodeCapacity``, msat like every other amount here -
+    #: suffixed on this side so a caller cannot read it as sats
+    node_capacity_msat: int | None = None
+    node_num_channels: int | None = None
+    node_num_peers: int | None = None
 
 
 @dataclass(frozen=True)
@@ -126,6 +131,15 @@ def _with_params(url: str, params: list[tuple[str, str]]) -> str:
     parts = urlparse(url)
     existing = parse_qsl(parts.query, keep_blank_values=True)
     return urlunparse(parts._replace(query=urlencode(existing + params)))
+
+
+def _optional_int(value: Any) -> int | None:
+    """An informational count or amount, or nothing. A SERVICE that sends
+    something other than a number for one is not worth failing the whole
+    response over - these fields are display only."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
 
 
 def _reject_error(body: Any) -> None:
@@ -220,6 +234,9 @@ def mint_address_request(url: str) -> Request:
             node_alias=body.get("nodeAlias"),
             node_uri=body.get("nodeUri"),
             node_color=body.get("nodeColor"),
+            node_capacity_msat=_optional_int(body.get("nodeCapacity")),
+            node_num_channels=_optional_int(body.get("nodeNumChannels")),
+            node_num_peers=_optional_int(body.get("nodeNumPeers")),
         )
 
     return Request(url=url, parse=parse)

@@ -15,6 +15,12 @@ from dataclasses import dataclass
 
 _FEE_RE = re.compile(r"^Mint fees:\s*(\d+)\s*,\s*(\d+)\s*$")
 
+#: The digits come from a SERVICE and are unbounded in length. Python would
+#: carry any of them exactly, but the shared vectors refuse anything past
+#: 2^53 - the value has to mean the same thing in every implementation, and
+#: elsewhere it is either imprecise or does not parse at all.
+_MAX_SAFE_INT = 2**53 - 1
+
 
 @dataclass(frozen=True)
 class MintFee:
@@ -39,6 +45,8 @@ def parse_mint_fee(metadata: str) -> MintFee | None:
             continue
         base_fee_msat = int(match.group(1))
         fee_ppm = int(match.group(2))
+        if base_fee_msat > _MAX_SAFE_INT or fee_ppm > _MAX_SAFE_INT:
+            continue
         # A fee of 100% or more can never net anything. Refusing it here is
         # also what keeps gross_up_for_mint_fee's search bounded, so a SERVICE
         # cannot stall a caller simply by advertising one.
