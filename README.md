@@ -162,6 +162,9 @@ as its TypeScript, Rust and Go siblings — and against the same adversarial
 mock mint, which can be told to drop a connection mid-mutation, sign in the
 wrong byte order, lie about a note's value, or never settle a melt.
 
+The wider ecosystem — wallets, mints, hardware and hosted services — is
+indexed in [awesome-lnurlcash](https://github.com/TheCryptoDonkey/awesome-lnurlcash).
+
 ## Development
 
 ```bash
