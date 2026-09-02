@@ -269,12 +269,19 @@ def test_a_settled_melt_burns_the_note_and_proves_it(mint, client):
 # ---- minting ----
 
 
-def test_mints_a_note_from_a_paid_invoice_and_rotates_it(mint, client):
+def test_mints_a_note_the_service_never_saw_the_secret_of(mint, client):
     m = mint()
     pay = client.fetch_pay_request(f"{m.url}/.well-known/lnurlp/mint")
     assert pay.withdraw_link
+    # LUD-25 minting is comment-bound, so a mint MUST leave room for the
+    # 64-character commitment. Without it there is nowhere to name the note.
+    assert pay.names_mint_output()
+    assert pay.comment_allowed == 64
 
-    invoice = client.request_invoice(pay.callback, 21000)
+    # The wallet chooses the secret, before any invoice exists, and persists
+    # it before paying. The SERVICE is told sha256 of it and nothing more.
+    mint_secret = secret()
+    invoice = client.request_mint_invoice(pay.callback, 21000, mint_secret)
     assert invoice.disposable is False
     assert invoice.verify
 
@@ -283,16 +290,36 @@ def test_mints_a_note_from_a_paid_invoice_and_rotates_it(mint, client):
 
     verified = client.fetch_invoice_verification(invoice.verify)
     assert verified.settled is True
-    # the preimage IS the note secret - which the mint necessarily saw
-    claimed = verified.preimage
-    assert hash_k1(claimed) == payment_hash
+    # The preimage is settlement proof and nothing else. Every node that
+    # forwarded the payment learned it; under the earlier draft that made all
+    # of them holders of the note. Here it redeems nothing.
+    preimage = verified.preimage
+    assert hash_k1(preimage) == payment_hash
+    assert preimage != mint_secret
+    with pytest.raises((NoteUnknown, NoteSpent, ServiceRejected)):
+        client.fetch_note_info(build_note_url(pay.withdraw_link, preimage))
 
-    info = client.fetch_note_info(build_note_url(pay.withdraw_link, claimed))
+    # The wallet's own secret is the note.
+    info = client.fetch_note_info(build_note_url(pay.withdraw_link, mint_secret))
     assert info.max_withdrawable == 21000
-    rotated = client.rotate_note(info.callback, claimed)
-    # after rotating, the secret the mint generated is worthless
-    assert m.note_state(claimed) == "burned"
+    rotated = client.rotate_note(info.callback, mint_secret)
+    assert m.note_state(mint_secret) == "burned"
     assert m.note_state(rotated.k1) == "outstanding"
+
+
+def test_refuses_to_pay_for_a_note_it_cannot_name(mint, client):
+    m = mint()
+    pay = client.fetch_pay_request(f"{m.url}/.well-known/lnurlp/mint")
+
+    # A malformed commitment is refused before the request leaves, so a WALLET
+    # never pays for a quote the SERVICE was always going to reject.
+    with pytest.raises(RequestRefused):
+        client.request_mint_invoice(pay.callback, 21000, "not-a-32-byte-secret")
+
+    # And an unnamed mint quote is refused by the SERVICE itself, before any
+    # invoice exists to pay.
+    with pytest.raises(ServiceRejected):
+        client.request_invoice(pay.callback, 21000)
 
 
 def test_reads_an_advertised_fee(mint, client):
@@ -311,12 +338,12 @@ def test_no_fee_advertised_means_fee_free(mint, client):
 def test_a_fee_charging_mint_credits_the_net_amount(mint, client):
     m = mint(baseFeeMsat=1000, feePpm=2000)
     pay = client.fetch_pay_request(f"{m.url}/.well-known/lnurlp/mint")
-    invoice = client.request_invoice(pay.callback, 100000)
+    mint_secret = secret()
+    invoice = client.request_mint_invoice(pay.callback, 100000, mint_secret)
     payment_hash = invoice.verify.rsplit("/", 1)[-1]
     m.settle(payment_hash)
-    claimed = client.fetch_invoice_verification(invoice.verify).preimage
 
-    info = client.fetch_note_info(build_note_url(pay.withdraw_link, claimed))
+    info = client.fetch_note_info(build_note_url(pay.withdraw_link, mint_secret))
     # 100000 - 1000 flat - 200 proportional
     from lnurlcash_kit import apply_mint_fee
 

@@ -7,8 +7,17 @@ from __future__ import annotations
 import pytest
 
 from conftest import load_vectors
+from lnurlcash_kit.protocol import (
+    invoice_request,
+    mint_invoice_request,
+    mint_invoice_request_with_hash,
+    pay_request_request,
+    verify_request,
+)
 from lnurlcash_kit import (
     MintFee,
+    ProtocolError,
+    RequestRefused,
     apply_mint_fee,
     build_note_url,
     decode_bolt11_amount_msat,
@@ -39,6 +48,10 @@ from lnurlcash_kit import (
 
 def _cases(name: str, key: str):
     return load_vectors(name)[key]
+
+
+def _nested(name: str, key: str, inner: str):
+    return load_vectors(name)[key][inner]
 
 
 # ---- signatures ----
@@ -217,3 +230,110 @@ def test_same_invoice(case):
 @pytest.mark.parametrize("case", _cases("bolt11.json", "isPreimage"))
 def test_is_preimage(case):
     assert is_preimage(case["value"]) is case["expect"]
+
+
+# ---- LUD-25 minting ----
+#
+# This is the suite that would have caught the library sitting on the deleted
+# preimage-keyed model for a month: nothing here states an opinion of its own,
+# so a draft change lands as a red test rather than as a silent divergence
+# discovered by a wallet that could not mint.
+
+_MINT_CALLBACK = "https://mint.example/p/cb"
+
+
+@pytest.mark.parametrize(
+    "case", _cases("pay-request.json", "accepted"), ids=lambda c: c["name"]
+)
+def test_pay_request_accepted(case):
+    info = pay_request_request("https://mint.example/p").parse(case["body"])
+    assert info.withdraw_link == case.get("withdrawLink")
+    assert info.comment_allowed == case.get("commentAllowed")
+    expected_fee = case.get("mintFee")
+    if expected_fee is None:
+        assert info.mint_fee is None
+    else:
+        assert info.mint_fee == MintFee(
+            base_fee_msat=expected_fee["baseFeeMsat"], fee_ppm=expected_fee["feePpm"]
+        )
+    # A payRequest is only a mint if it can carry the commitment, and a mint is
+    # only a mint if it advertises where the note will live.
+    assert info.names_mint_output() is (info.withdraw_link is not None)
+
+
+@pytest.mark.parametrize(
+    "case", _cases("pay-request.json", "rejected"), ids=lambda c: c["name"]
+)
+def test_pay_request_rejected(case):
+    with pytest.raises(ProtocolError):
+        pay_request_request("https://mint.example/p").parse(case["body"])
+
+
+@pytest.mark.parametrize(
+    "case",
+    _nested("pay-request.json", "mintCallback", "accepted"),
+    ids=lambda c: c["name"],
+)
+def test_mint_callback_names_the_note(case):
+    request = mint_invoice_request_with_hash(
+        _MINT_CALLBACK, case["amountMsat"], case["comment"]
+    )
+    # LUD-25 carries the commitment as a mandatory LUD-12 comment; h repeats it
+    # for the additive ForgeSworn profile.
+    assert f"comment={case['comment']}" in request.url
+    assert f"h={case['comment']}" in request.url
+    assert f"amount={case['amountMsat']}" in request.url
+    assert case["noteId"] == case["comment"]
+    assert case["paymentPreimageIsBearerK1"] is False
+
+
+@pytest.mark.parametrize(
+    "case",
+    _nested("pay-request.json", "mintCallback", "rejected"),
+    ids=lambda c: c["name"],
+)
+def test_mint_callback_refuses_an_unnamed_output(case):
+    # A null comment is the unnamed mint the draft forbids: this library cannot
+    # express one, because the minting builder requires the commitment. A
+    # malformed one is refused before anything is sent.
+    with pytest.raises(RequestRefused):
+        if case["comment"] is None:
+            mint_invoice_request(_MINT_CALLBACK, case["amountMsat"], "")
+        else:
+            mint_invoice_request_with_hash(
+                _MINT_CALLBACK, case["amountMsat"], case["comment"]
+            )
+
+
+@pytest.mark.parametrize(
+    "case", _nested("pay-request.json", "invoice", "accepted"), ids=lambda c: c["name"]
+)
+def test_invoice_accepted(case):
+    result = invoice_request(_MINT_CALLBACK, case["requestedMsat"]).parse(case["body"])
+    assert result.disposable is case["disposable"]
+    assert result.verify == case.get("verify")
+
+
+@pytest.mark.parametrize(
+    "case", _nested("pay-request.json", "invoice", "rejected"), ids=lambda c: c["name"]
+)
+def test_invoice_rejected(case):
+    with pytest.raises(ProtocolError):
+        invoice_request(_MINT_CALLBACK, case["requestedMsat"]).parse(case["body"])
+
+
+@pytest.mark.parametrize(
+    "case", _nested("pay-request.json", "verify", "accepted"), ids=lambda c: c["name"]
+)
+def test_verify_accepted(case):
+    result = verify_request("https://mint.example/verify/abc").parse(case["body"])
+    assert result.settled is case["settled"]
+    assert result.preimage == case.get("preimage")
+
+
+@pytest.mark.parametrize(
+    "case", _nested("pay-request.json", "verify", "rejected"), ids=lambda c: c["name"]
+)
+def test_verify_rejected(case):
+    with pytest.raises(ProtocolError):
+        verify_request("https://mint.example/verify/abc").parse(case["body"])

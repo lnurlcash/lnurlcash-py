@@ -166,7 +166,21 @@ class LnurlcashClient(_Base):
         return self._run(protocol.pay_request_request(url))
 
     def request_invoice(self, pay_callback: str, amount_msat: int) -> InvoiceResult:
+        """A plain LUD-06 invoice. Mints nothing: it names no output."""
         return self._run(protocol.invoice_request(pay_callback, amount_msat))
+
+    def request_mint_invoice(
+        self, pay_callback: str, amount_msat: int, mint_secret: str
+    ) -> InvoiceResult:
+        """An invoice that mints a note the caller already holds the secret to.
+
+        **Persist ``mint_secret`` before paying the invoice this returns.** The
+        SERVICE only ever learns its hash, so it cannot help reconstruct it,
+        and a paid invoice whose secret was lost is a note nobody can spend.
+        """
+        return self._run(
+            protocol.mint_invoice_request(pay_callback, amount_msat, mint_secret)
+        )
 
     def fetch_invoice_verification(self, verify_url: str) -> VerifyResult:
         return self._run(protocol.verify_request(verify_url))
@@ -289,7 +303,19 @@ class AsyncLnurlcashClient(_Base):
     async def request_invoice(
         self, pay_callback: str, amount_msat: int
     ) -> InvoiceResult:
+        """A plain LUD-06 invoice. Mints nothing: it names no output."""
         return await self._run(protocol.invoice_request(pay_callback, amount_msat))
+
+    async def request_mint_invoice(
+        self, pay_callback: str, amount_msat: int, mint_secret: str
+    ) -> InvoiceResult:
+        """An invoice that mints a note the caller already holds the secret to.
+
+        **Persist ``mint_secret`` before paying the invoice this returns.**
+        """
+        return await self._run(
+            protocol.mint_invoice_request(pay_callback, amount_msat, mint_secret)
+        )
 
     async def fetch_invoice_verification(self, verify_url: str) -> VerifyResult:
         return await self._run(protocol.verify_request(verify_url))

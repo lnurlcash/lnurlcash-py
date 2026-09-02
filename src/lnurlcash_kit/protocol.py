@@ -28,7 +28,7 @@ from .errors import (
 from .fees import MintFee, parse_mint_fee
 from .bolt11 import decode_bolt11_amount_msat
 from .note import note_k1
-from .secrets import generate_note_secret, hash_k1
+from .secrets import generate_note_secret, hash_k1, is_preimage
 from .urls import is_allowed_service_url
 
 
@@ -79,9 +79,38 @@ class PayRequestInfo:
     min_sendable: int
     max_sendable: int
     metadata: str
+    #: Present when paying this mints a bearer note: the raw LUD-17 withdraw
+    #: endpoint, in either the plain or the ``lnurlw://`` spelling. The draft
+    #: says "as described in LUD-17", and LUD-17 describes both, so a WALLET
+    #: accepts either unchanged.
     withdraw_link: str | None = None
     mint_pubkey: str | None = None
+    #: ``None`` means the SERVICE advertised no fee, which the draft says to
+    #: read as fee-free rather than as unknown.
     mint_fee: MintFee | None = None
+    #: LUD-12's field, and LUD-25's minting capability. A mint MUST allow the
+    #: 64 characters a hex-encoded SHA-256 commitment needs.
+    comment_allowed: int | None = None
+    #: Additive ForgeSworn extension: this SERVICE also accepts the same
+    #: commitment as an ``h`` parameter. Never a substitute for the mandatory
+    #: comment, and anything that is not exactly ``True`` reads as false.
+    mint_to_hash: bool = False
+
+    def names_mint_output(self) -> bool:
+        """Whether this SERVICE can mint a current-draft LUD-25 note.
+
+        ``mint_to_hash`` alone cannot stand in for it: that extension is
+        additive and predates the comment spelling, and a SERVICE without the
+        comment capacity has nowhere to put the commitment.
+        """
+        return (
+            self.comment_allowed is not None
+            and self.comment_allowed >= MINT_COMMENT_LENGTH
+        )
+
+
+#: The exact comment capacity minting needs: 32 bytes as lowercase hex.
+MINT_COMMENT_LENGTH = 64
 
 
 @dataclass(frozen=True)
@@ -404,20 +433,47 @@ def pay_request_request(url: str) -> Request:
         ):
             raise ProtocolError("Not a payRequest (unexpected response).")
         metadata = body.get("metadata")
-        return PayRequestInfo(
+        # A withdrawLink that is present but not a string is a broken mint,
+        # not a mint without one. Reading it as absent would send the caller
+        # down the well-known fallback and quietly mint against the wrong
+        # endpoint.
+        withdraw_link = body.get("withdrawLink")
+        if withdraw_link is not None and not isinstance(withdraw_link, str):
+            raise ProtocolError("The mint's payRequest has an invalid withdrawLink.")
+        comment_allowed = body.get("commentAllowed")
+        if not isinstance(comment_allowed, int) or isinstance(comment_allowed, bool):
+            comment_allowed = None
+        info = PayRequestInfo(
             callback=body["callback"],
             min_sendable=body.get("minSendable", 0),
             max_sendable=body.get("maxSendable", 0),
             metadata=metadata if isinstance(metadata, str) else "",
-            withdraw_link=body.get("withdrawLink"),
+            withdraw_link=withdraw_link,
             mint_pubkey=body.get("mintPubkey"),
             mint_fee=parse_mint_fee(metadata) if isinstance(metadata, str) else None,
+            comment_allowed=comment_allowed,
+            mint_to_hash=body.get("mintToHash") is True,
         )
+        # LUD-25: minting is comment-bound. A payRequest that advertises a
+        # withdrawLink but no room for the 64-character commitment is offering
+        # something it cannot deliver, and the failure would otherwise land
+        # after the caller had already paid.
+        if info.withdraw_link is not None and not info.names_mint_output():
+            raise ProtocolError(
+                "This mint offers no room for the required output commitment "
+                "- it cannot mint."
+            )
+        return info
 
     return Request(url=url, parse=parse)
 
 
 def invoice_request(pay_callback: str, amount_msat: int) -> Request:
+    """A plain LUD-06 invoice request.
+
+    Correct for paying an ordinary Lightning address; it mints nothing,
+    because it names no output. To mint, use :func:`mint_invoice_request`.
+    """
     url = _with_params(pay_callback, [("amount", str(amount_msat))])
 
     def parse(body: Any) -> InvoiceResult:
@@ -442,12 +498,74 @@ def invoice_request(pay_callback: str, amount_msat: int) -> Request:
     return Request(url=url, parse=parse)
 
 
+def mint_invoice_request_with_hash(
+    pay_callback: str, amount_msat: int, h: str
+) -> Request:
+    """Ask for a mint invoice, naming the note it will credit.
+
+    ``h`` is ``sha256(secret)`` for a secret only the WALLET holds. LUD-25
+    carries it as a mandatory LUD-12 ``comment``; ``h`` repeats the identical
+    value for SERVICEs that took the parameter form first. It is never an
+    alternative to the comment.
+
+    The SERVICE learns a hash and nothing else, so the payment preimage is
+    settlement proof only - it can never redeem the note. That is the whole
+    point of the current draft: a preimage propagates to every routing node
+    that forwards the payment, and a note keyed by one is a note they can all
+    spend.
+    """
+    h = h.strip().lower()
+    # Refused here rather than sent, so a WALLET never pays for a quote the
+    # SERVICE was always going to reject.
+    if not is_preimage(h):
+        raise RequestRefused(
+            "An output commitment must be 32 bytes of hex "
+            "- no invoice was requested."
+        )
+    # The response shape is an ordinary LUD-06 invoice; reuse its parser
+    # rather than restating it.
+    inner = invoice_request(pay_callback, amount_msat)
+    url = _with_params(
+        pay_callback,
+        [("amount", str(amount_msat)), ("comment", h), ("h", h)],
+    )
+    return Request(url=url, parse=inner.parse)
+
+
+def mint_invoice_request(
+    pay_callback: str, amount_msat: int, mint_secret: str
+) -> Request:
+    """:func:`mint_invoice_request_with_hash`, from the secret itself.
+
+    The secret comes back on :attr:`Request.new_secrets`. **Persist it before
+    paying the invoice this returns.** Paying for a note and then losing its
+    secret is the one way the comment-bound scheme is worse than the preimage
+    one it replaced, and persisting first removes it entirely. Drawing the
+    secret from the seed derivation rather than the CSPRNG makes the note
+    recoverable from birth, without any rotate at all.
+    """
+    # Checked before hashing, so a malformed secret is RequestRefused - the
+    # caller's own input, nothing sent - rather than an error that accuses the
+    # SERVICE of a broken response it never sent.
+    if not is_preimage(mint_secret):
+        raise RequestRefused(
+            "A note secret must be 32 bytes of hex - no invoice was requested."
+        )
+    inner = mint_invoice_request_with_hash(
+        pay_callback, amount_msat, hash_k1(mint_secret)
+    )
+    return Request(url=inner.url, parse=inner.parse, new_secrets=[mint_secret])
+
+
 def verify_request(verify_url: str) -> Request:
-    """LUD-21. For LNURLcash specifically, a settled invoice's preimage IS the
-    bearer note's spend secret, and a verify GET proves nothing about who is
-    asking - only that they know the payment hash, which travels inside the
-    invoice itself. A caller receiving a preimage here MUST rotate
-    immediately."""
+    """LUD-21, to learn whether a mint or melt has settled.
+
+    Under current LUD-25 this is unconditionally safe to call and its answer
+    unconditionally safe to disclose: minting is comment-bound, so the
+    preimage a settled invoice reveals is settlement proof and never the
+    note's credential. (It was not always so. An earlier draft keyed the note
+    by the payment preimage, which made this endpoint hand out the money; that
+    fallback is gone.)"""
 
     def parse(body: Any) -> VerifyResult:
         _reject_error(body)

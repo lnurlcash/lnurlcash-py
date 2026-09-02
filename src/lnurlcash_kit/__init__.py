@@ -52,6 +52,7 @@ from .note import (
     without_k1,
 )
 from .protocol import (
+    MINT_COMMENT_LENGTH,
     InvoiceResult,
     MeltResult,
     MintAddressInfo,
@@ -117,6 +118,7 @@ __all__ = [
     "MeltResult",
     "MintAddressInfo",
     "MutationResult",
+    "MINT_COMMENT_LENGTH",
     "PayRequestInfo",
     "RotateResult",
     "SplitResult",
