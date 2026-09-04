@@ -83,3 +83,24 @@ ProtocolError      a non-mutating response did not match the spec
 ## Conformance
 
 https://github.com/TheCryptoDonkey/lnurlcash-conformance
+
+Seed-recoverable note secrets (LUD-25):
+derive_cash_root(seed) -> CashNode              BIP-32 m/139'
+derive_cash_domain_node(root, host) -> CashNode m/139'/d1/d2/d3/d4, d1..d4 =
+  HMAC-SHA256(privkey at m/139'/0, host)[0..16] as 4 RAW big-endian uint32.
+  RAW: BIP-32 reads >= 2^31 as hardened, so ~half the levels are, decided by
+  the host name. NEVER mask the top bit, NEVER harden all four - either
+  derives a different tree and restores nothing, silently.
+derive_cash_secret(root, host, i) / cash_secret_at(domain_node, i)
+  no unhardened level below the domain node, so a signer given the node needs
+  no curve - which is why the node is its own step
+cash_node_to_hex / cash_node_from_hex   privateKey || chainCode, 64 bytes
+derive_cash_child(node, raw_uint32)     BIP-32 CKDpriv, for checking this
+  library against BIP-32's own vectors
+CashSecretSource(root, host, start)()   -> k1; .next_index is what you persist
+derive_note_root / derive_note_secret   LEGACY pre-spec HMAC scheme. Do not
+  mint under it; still scanned so old notes stay findable.
+build_note_info_url_by_hash(link, h) / note_info_by_hash_request(link, h)
+  the ?h= informational GET, so a restore walk keeps secrets off the wire.
+  A rejection proves nothing: unsupported, unknown and BURNED are one answer.
+  The persisted per-host counter is the real backup, not the scan.

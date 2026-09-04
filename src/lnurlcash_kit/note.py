@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+from .errors import ProtocolError
 from .secrets import is_preimage
 from .urls import from_lud17, resolve_lnurl_input
 
@@ -105,6 +106,34 @@ def build_note_url(
     pairs.append(("k1", k1.strip().lower()))
     if amount_msat is not None:
         pairs.append(("amount", str(amount_msat)))
+    return _rebuild(url, pairs)
+
+
+def build_note_info_url_by_hash(withdraw_link: str, h: str) -> str:
+    """The informational GET for a note named by its HASH rather than its
+    secret.
+
+    LUD-25's "Checking a note without exposing it": a SERVICE MAY accept
+    ``?h=<hex sha256 of k1>`` in place of ``?k1=``, on the informational GET
+    only and never at the callback. It already stores every note under that
+    hash, so this is a second way into a lookup it can do anyway - and the
+    secret stays off the wire, which is what a restore walk needs, since a walk
+    queries a whole gap window of indices the wallet has not minted into yet.
+
+    ``k1``, ``amount`` and ``sig`` are dropped: naming the note twice, once in
+    a form that spends it, would defeat the point.
+
+    A SERVICE that does not index by hash answers exactly as it answers for an
+    unknown ``k1``, which LUD-25 requires, so a rejection here never
+    distinguishes "not supported" from "no such note" - and a burned note is
+    deliberately indistinguishable from one that never existed.
+    """
+    hash_hex = h.strip().lower()
+    if not is_preimage(hash_hex):
+        raise ProtocolError("a note hash must be 32 bytes of hex")
+    url = from_lud17(withdraw_link.strip())
+    pairs = [(k, v) for k, v in _query_pairs(url) if k not in ("k1", "amount", "sig")]
+    pairs.append(("h", hash_hex))
     return _rebuild(url, pairs)
 
 

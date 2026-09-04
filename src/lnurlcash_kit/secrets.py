@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import re
 import secrets as _secrets
 from hashlib import sha256
@@ -31,3 +32,33 @@ def generate_note_secret() -> str:
 def is_preimage(value: str) -> bool:
     """A payment preimage, and therefore a note secret: 32 bytes hex."""
     return bool(_PREIMAGE_RE.match(value.strip()))
+
+
+# ---- the legacy derivation ----
+#
+# This project shipped this scheme before LUD-25 had a section on deriving note
+# secrets at all::
+#
+#     root = HMAC-SHA256(key = utf8("lnurlcash-note-v1"), msg = seed)
+#     k1_i = HMAC-SHA256(key = root,                      msg = utf8(host + ":" + index))
+#
+# It is NOT what a new wallet should mint under - see :mod:`lnurlcash_kit.cash`
+# for the scheme the draft actually specifies. It is here because notes minted
+# under it are still money, and a restore that walked only the current scheme
+# would leave them at a mint it can no longer name.
+
+_NOTE_DERIVATION_DOMAIN = b"lnurlcash-note-v1"
+
+
+def derive_note_root(seed: bytes) -> bytes:
+    """The legacy scheme's root. ``seed`` is raw bytes, of any length."""
+    return hmac.new(_NOTE_DERIVATION_DOMAIN, seed, sha256).digest()
+
+
+def derive_note_secret(root: bytes, host: str, index: int) -> str:
+    """The legacy scheme's i-th secret at ``host``, as 32 bytes of hex.
+
+    ``host`` is the mint host as the wallet stores it - lowercase, port
+    included where there is one - and ``index`` counts from 0.
+    """
+    return hmac.new(root, f"{host}:{index}".encode("utf-8"), sha256).hexdigest()
