@@ -8,6 +8,9 @@ What each class means for the money involved:
     AmbiguousMint     the outcome is unknown. The request MAY have been
                       processed. Nothing may be assumed either way.
     ProtocolError     a non-mutating response did not match the spec.
+    UnverifiableNote  a MUTATION landed and the SERVICE returned no signature
+                      over it. The note exists; it just cannot be verified
+                      offline.
 
 Treating an ambiguous failure as a definitive one is how wallets lose money:
 a rotate that times out after the SERVICE burned the input has already
@@ -38,6 +41,11 @@ class ServiceRejected(LnurlcashError):
     def __init__(self, reason: str) -> None:
         super().__init__(reason or "The service rejected the request.")
         self.reason = reason
+        #: The fresh WALLET-generated secrets a MUTATION disclosed the hashes
+        #: of, when this refusal is one that could describe a mutation the
+        #: SERVICE had already applied - see ``new_secrets_of``. Empty on every
+        #: other refusal, and on every non-mutating call.
+        self.new_secrets: list[str] = []
 
 
 class NotePending(ServiceRejected):
@@ -81,6 +89,29 @@ class AmbiguousMint(LnurlcashError):
     did not carry the expected confirmation."""
 
 
+class UnverifiableNote(LnurlcashError):
+    """The SERVICE confirmed a rotate, split or merge with {"status":"OK"}
+    but returned no signature over the hash it was given.
+
+    LUD-25 makes offline verification mandatory, so this is a non-compliant
+    SERVICE - but the mutation LANDED. The note exists, at the hash the caller
+    disclosed, and the WALLET-generated secret behind it is the only key to
+    that value anywhere.
+
+    So this is an exception about the note's VERIFIABILITY, never about its
+    existence, and it carries the secrets for the same reason
+    AmbiguousMutation does: raising without them would strand real money to
+    make a point about conformance. Persist ``new_secrets``, then decide
+    whether to keep dealing with a mint that issues notes nobody can check.
+
+    Only ever raised when the policy requires signatures, which is the default.
+    """
+
+    def __init__(self, message: str, new_secrets: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.new_secrets = new_secrets or []
+
+
 class AmbiguousMutation(AmbiguousMint):
     """An AmbiguousMint from a rotate, split or merge, carrying the fresh
     WALLET-generated secrets whose hashes the uncertain request disclosed.
@@ -97,6 +128,26 @@ class AmbiguousMutation(AmbiguousMint):
     def __init__(self, message: str, new_secrets: list[str]) -> None:
         super().__init__(message)
         self.new_secrets = new_secrets
+
+
+def new_secrets_of(err: BaseException) -> list[str]:
+    """The fresh secrets an exception is carrying, or none.
+
+    Three families carry them. AmbiguousMutation always does: the outcome is
+    unknown and they may be the only copies of what the SERVICE minted.
+    UnverifiableNote always does, and more urgently, because there the note is
+    known to exist. And a definitive refusal does when it names an input as
+    spent or unknown, because at a SERVICE that has not implemented LUD-25's
+    replay rule that is also what a mutation it ALREADY applied looks like.
+
+    Either way the rule for a caller is the same, and it is the first thing to
+    do: persist these before anything else.
+    """
+    if isinstance(err, (AmbiguousMutation, UnverifiableNote)):
+        return err.new_secrets
+    if isinstance(err, ServiceRejected):
+        return err.new_secrets
+    return []
 
 
 def classify_note_error(reason: str) -> ServiceRejected:

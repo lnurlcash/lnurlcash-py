@@ -14,14 +14,18 @@ from lnurlcash_kit import (
     AmbiguousMint,
     AmbiguousMutation,
     LnurlcashClient,
+    LnurlcashError,
     NotePending,
     NoteSpent,
     NoteUnknown,
+    Policy,
     ProtocolError,
     RequestRefused,
     ServiceRejected,
+    UnverifiableNote,
     build_note_url,
     hash_k1,
+    new_secrets_of,
     verify_note_signature,
 )
 
@@ -33,6 +37,18 @@ def secret() -> str:
 @pytest.fixture
 def client() -> LnurlcashClient:
     return LnurlcashClient(timeout=10.0)
+
+
+@pytest.fixture
+def no_retry_client() -> LnurlcashClient:
+    """A client that gives up on the first ambiguous answer, as every client
+    did before LUD-25 required a SERVICE to replay a retried mutation.
+
+    The tests that assert what an unresolved mutation carries need it: with
+    retries on, a conforming mint simply answers again and there is nothing
+    left to carry.
+    """
+    return LnurlcashClient(timeout=10.0, mutation_retries=0)
 
 
 # ---- the informational GET ----
@@ -117,8 +133,34 @@ def test_accepts_the_other_recovery_id_layout(mint, client):
     assert verify_note_signature(rotated.k1, 21000, rotated.signature, m.pubkey)
 
 
-def test_works_without_signatures(mint, client):
+def test_an_unsigned_rotate_is_refused_without_losing_the_note(mint, client):
+    """Offline verification stopped being optional, so a SERVICE issuing no
+    signatures is non-compliant rather than merely basic.
+
+    The refusal has to be the loud kind - but the rotate LANDED, and the fresh
+    secret is the only key to the note it minted, so the exception carries it
+    out. Raising without it would be the library destroying real money to make
+    a point about conformance.
+    """
     m = mint(signatures=False)
+    k1 = secret()
+    m.credit(k1, 21000)
+    info = client.fetch_note_info(m.note_url(k1))
+    with pytest.raises(UnverifiableNote) as raised:
+        client.rotate_note(info.callback, k1)
+    kept = new_secrets_of(raised.value)
+    assert len(kept) == 1
+    # the note the caller was refused is real, outstanding, and reachable with
+    # nothing but the secret the exception handed back
+    assert m.note_state(kept[0]) == "outstanding"
+
+
+def test_an_unsigned_service_still_works_when_the_caller_opts_out(mint):
+    """The same mint, for a caller who has decided to deal with it anyway."""
+    m = mint(signatures=False)
+    client = LnurlcashClient(
+        timeout=10.0, policy=Policy(require_signatures=False)
+    )
     k1 = secret()
     m.credit(k1, 21000)
     info = client.fetch_note_info(m.note_url(k1))
@@ -377,7 +419,41 @@ def test_a_sunsetting_mint_refuses_definitively(mint, client):
 # ---- ambiguous outcomes ----
 
 
-def test_a_lost_rotate_preserves_its_fresh_secret(mint, client):
+def test_a_lost_rotate_completes_by_asking_again(mint, client):
+    """The mutation landed and the answer was lost on the way back. LUD-25 now
+    requires the SERVICE to answer the identical request with the success it
+    already gave, so asking a second time turns this from an unresolved maybe
+    into a completed rotate - the caller never sees an exception at all."""
+    m = mint(dropAfterMutation=True)
+    k1 = secret()
+    m.credit(k1, 21000)
+
+    rotated = client.rotate_note(f"{m.url}/w/cb", k1)
+    assert m.note_state(k1) == "burned"
+    assert m.note_state(rotated.k1) == "outstanding"
+    # the replay repeats the signature, so a note recovered this way is as
+    # verifiable as one whose first answer arrived
+    assert rotated.signature is not None
+
+
+def test_a_mint_that_will_not_replay_still_hands_the_secrets_back(mint, client):
+    """A SERVICE that has not implemented the replay rule answers the second
+    attempt as an already-spent input, exactly as before. The library cannot
+    tell that from a genuine double spend - at the wire they are the same
+    answer - so it hands the secrets back rather than a verdict."""
+    m = mint(dropAfterMutation=True, retriedMutation="refuse")
+    k1 = secret()
+    m.credit(k1, 21000)
+
+    with pytest.raises(LnurlcashError) as raised:
+        client.rotate_note(f"{m.url}/w/cb", k1)
+    rescued = new_secrets_of(raised.value)
+    assert len(rescued) == 1
+    assert m.note_state(rescued[0]) == "outstanding"
+
+
+def test_a_lost_rotate_preserves_its_fresh_secret(mint, no_retry_client):
+    client = no_retry_client
     m = mint(dropAfterMutation=True)
     k1 = secret()
     m.credit(k1, 21000)
@@ -394,7 +470,8 @@ def test_a_lost_rotate_preserves_its_fresh_secret(mint, client):
     assert client.fetch_note_info(m.note_url(rescued)).max_withdrawable == 21000
 
 
-def test_a_lost_split_preserves_both_secrets_in_output_order(mint, client):
+def test_a_lost_split_preserves_both_secrets_in_output_order(mint, no_retry_client):
+    client = no_retry_client
     m = mint(dropAfterMutation=True)
     k1 = secret()
     m.credit(k1, 21000)
@@ -406,7 +483,8 @@ def test_a_lost_split_preserves_both_secrets_in_output_order(mint, client):
     assert client.fetch_note_info(m.note_url(change)).max_withdrawable == 16000
 
 
-def test_probing_resolves_the_ambiguity(mint, client):
+def test_probing_resolves_the_ambiguity(mint, no_retry_client):
+    client = no_retry_client
     m = mint(dropAfterMutation=True)
     k1 = secret()
     m.credit(k1, 21000)
@@ -424,7 +502,8 @@ def test_probing_resolves_the_ambiguity(mint, client):
     assert offline.probe_burned_note(live.note_url(alive)) == "unknown"
 
 
-def test_a_200_that_confirms_nothing_is_ambiguous(mint, client):
+def test_a_200_that_confirms_nothing_is_ambiguous(mint, no_retry_client):
+    client = no_retry_client
     m = mint(unconfirmedMutation=True)
     k1 = secret()
     m.credit(k1, 21000)

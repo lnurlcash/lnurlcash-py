@@ -49,6 +49,16 @@ returns Request(url, parse, new_secrets) and performs no I/O.
    may already have minted.
 4. RequestRefused means nothing was sent - safe to treat as a no-op.
 5. A melt's OK means IN FLIGHT, not spent. NotePending means retry, not spent.
+5b. Offline verification is MANDATORY. A conforming service publishes
+   mintPubkey on every withdrawRequest and returns sig (and sig2 on a split)
+   from every rotate/split/merge. This library refuses a service that does not;
+   UnverifiableNote means the mutation LANDED unsigned, so keep its secrets.
+   Opt out with policy=Policy(require_signatures=False).
+5c. A retried rotate/split/merge MUST be answered by the service as a replay of
+   the original success, so a client re-sends one whose answer was lost
+   (mutation_retries, default 1) and usually completes it. NEVER a melt. The
+   IDENTICAL request goes out: the replay is matched on the k1 set, h, h2 and
+   amount, so a fresh secret would make it a different mutation.
 6. Rotate immediately after claiming a minted note: the mint generated that
    preimage, and LUD-21 verify exposes it to anyone who saw the invoice.
 7. Never log note URLs. The secret is in the query string.
@@ -59,6 +69,11 @@ returns Request(url, parse, new_secrets) and performs no I/O.
 RequestRefused     nothing sent, note untouched
 ServiceRejected    processed and refused (definitive)
   NotePending      a melt is in flight on this k1 - retry
+UnverifiableNote   the mutation LANDED and came back unsigned. The note is
+                   REAL; carries .new_secrets - persist them
+new_secrets_of(err) the secrets carried by ANY exception that could describe a
+                   mutation the service applied: ambiguous, unverifiable, spent
+                   or unknown
   NoteSpent        authoritative: already burned
   NoteUnknown      service does not recognise it
 AmbiguousMint      outcome UNKNOWN - assume nothing

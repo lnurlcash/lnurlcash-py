@@ -23,6 +23,7 @@ from .errors import (
     ProtocolError,
     RequestRefused,
     ServiceRejected,
+    UnverifiableNote,
     classify_note_error,
 )
 from .fees import MintFee, parse_mint_fee
@@ -42,6 +43,52 @@ class Request:
     #: If the outcome is unknown they may be the only copies of notes the
     #: SERVICE has already minted, so they must ride the failure out.
     new_secrets: list[str] = field(default_factory=list)
+    #: whether a client may re-send this request when the transport loses its
+    #: answer. True for a rotate, split or merge, which LUD-25 requires a
+    #: SERVICE to answer as a replay of the original success ("Retrying a
+    #: mutation"). False for everything else, and for a melt above all: it
+    #: carries ``pr``, is paid out asynchronously, and has no replay guarantee,
+    #: so a second request could ask for a second payment.
+    replayable: bool = False
+
+
+@dataclass(frozen=True)
+class Policy:
+    """What this library insists a SERVICE does, rather than merely hopes.
+
+    LUD-25 makes offline verification mandatory: a SERVICE MUST publish
+    ``mintPubkey`` and MUST sign every note a rotate, split or merge mints. A
+    wallet that quietly accepted unsigned notes would be handing its holder
+    something nobody downstream can check, which is the exact gap offline
+    verification exists to close - so the default insists.
+
+    Set ``require_signatures`` false only to talk to a SERVICE that predates
+    the requirement, and only knowing the cost.
+    """
+
+    require_signatures: bool = True
+
+
+#: The strict policy, used wherever a caller states none.
+DEFAULT_POLICY = Policy()
+
+
+def is_compressed_pubkey(value: Any) -> bool:
+    """Whether ``value`` is a compressed secp256k1 point: 33 bytes hex, the
+    leading byte naming which of the two y values the x coordinate stands for.
+
+    Checked at the response rather than at the first signature check, because
+    a ``mintPubkey`` that is not one verifies nothing - and the same fault
+    found later looks like a forged note instead of a broken mint.
+    """
+    if not isinstance(value, str):
+        return False
+    key = value.strip().lower()
+    return (
+        len(key) == 66
+        and key[:2] in ("02", "03")
+        and all(char in "0123456789abcdef" for char in key)
+    )
 
 
 @dataclass(frozen=True)
@@ -51,6 +98,9 @@ class WithdrawRequestInfo:
     max_withdrawable: int
     min_withdrawable: int = 0
     default_description: str | None = None
+    #: LUD-25 makes offline verification mandatory, so a conforming SERVICE
+    #: always publishes the key its notes verify against here. Only ever None
+    #: when the caller passed a Policy with ``require_signatures`` false.
     mint_pubkey: str | None = None
 
 
@@ -183,7 +233,7 @@ def _reject_error(body: Any) -> None:
 # ---- the informational GET ----
 
 
-def note_info_request(url: str) -> Request:
+def note_info_request(url: str, policy: Policy = DEFAULT_POLICY) -> Request:
     """LUD-03 step one. Never burns, rotates or alters the note.
 
     ``sig`` is stripped before the request: it is only meaningful to a holder
@@ -227,13 +277,28 @@ def note_info_request(url: str) -> Request:
                 "note may have been redeemed elsewhere, or the service isn't "
                 "spec-compliant."
             )
+        mint_pubkey = body.get("mintPubkey")
+        # Separate from the shape check above, and separately worded: this
+        # response IS a withdrawRequest, it just describes a note nobody can
+        # check offline. Saying "not a withdrawRequest" would send a caller
+        # after the wrong fault.
+        if policy.require_signatures and not is_compressed_pubkey(mint_pubkey):
+            raise ProtocolError(
+                "This service publishes no mintPubkey, so its notes cannot be "
+                "verified offline (LUD-25 requires one)."
+                if mint_pubkey is None
+                else "This service published a mintPubkey that is not a "
+                "33-byte compressed secp256k1 key."
+            )
         return WithdrawRequestInfo(
             callback=callback,
             k1=k1.lower(),
             max_withdrawable=maximum,
             min_withdrawable=minimum or 0,
             default_description=body.get("defaultDescription"),
-            mint_pubkey=body.get("mintPubkey"),
+            mint_pubkey=mint_pubkey.strip().lower()
+            if isinstance(mint_pubkey, str)
+            else None,
         )
 
     return Request(url=request_url, parse=parse)
@@ -290,6 +355,28 @@ def _parse_success(body: Any) -> dict:
     return body
 
 
+def _require_signature(
+    value: Any, policy: Policy, what: str
+) -> str | None:
+    """Every mutation the replay rule covers owes a signature over each note
+    it mints, and LUD-25 no longer lets a SERVICE opt out.
+
+    The mutation has already landed by the time this is called - ``status`` was
+    OK - so the exception has to carry the caller's secrets out with it, or
+    enforcing the spec becomes the thing that loses the money. ``new_secrets``
+    is filled in by the client, which is what holds them.
+    """
+    if isinstance(value, str) and value:
+        return value
+    if not policy.require_signatures:
+        return None
+    raise UnverifiableNote(
+        f"The service confirmed the {what} but returned no signature, so the "
+        "note it just minted cannot be verified offline. The note exists - "
+        "keep the secret."
+    )
+
+
 def _callback(callback: str, params: list[tuple[str, str]]) -> str:
     if not is_allowed_service_url(callback):
         raise RequestRefused("The service provided an invalid callback URL.")
@@ -326,18 +413,27 @@ def melt_request(callback: str, k1: str, pr: str) -> Request:
     return Request(url=url, parse=parse)
 
 
-def rotate_request_with_hash(callback: str, k1: str, h: str) -> Request:
+def rotate_request_with_hash(
+    callback: str, k1: str, h: str, policy: Policy = DEFAULT_POLICY
+) -> Request:
     url = _callback(callback, [("k1", k1), ("h", h)])
 
     def parse(body: Any) -> MutationResult:
         ok = _parse_success(body)
-        return MutationResult(signature=ok.get("sig"))
+        return MutationResult(
+            signature=_require_signature(ok.get("sig"), policy, "rotate")
+        )
 
-    return Request(url=url, parse=parse)
+    return Request(url=url, parse=parse, replayable=True)
 
 
 def split_request_with_hash(
-    callback: str, k1s: list[str], amount_msat: int, h: str, h2: str
+    callback: str,
+    k1s: list[str],
+    amount_msat: int,
+    h: str,
+    h2: str,
+    policy: Policy = DEFAULT_POLICY,
 ) -> Request:
     url = _callback(
         callback,
@@ -347,19 +443,30 @@ def split_request_with_hash(
 
     def parse(body: Any) -> MutationResult:
         ok = _parse_success(body)
-        return MutationResult(signature=ok.get("sig"), change_signature=ok.get("sig2"))
+        # Both outputs of a split are notes, and both need a signature.
+        # Checked in output order so the message names the one missing.
+        return MutationResult(
+            signature=_require_signature(ok.get("sig"), policy, "split"),
+            change_signature=_require_signature(
+                ok.get("sig2"), policy, "split's change"
+            ),
+        )
 
-    return Request(url=url, parse=parse)
+    return Request(url=url, parse=parse, replayable=True)
 
 
-def merge_request_with_hash(callback: str, k1s: list[str], h: str) -> Request:
+def merge_request_with_hash(
+    callback: str, k1s: list[str], h: str, policy: Policy = DEFAULT_POLICY
+) -> Request:
     url = _callback(callback, [("k1", k1) for k1 in k1s] + [("h", h)])
 
     def parse(body: Any) -> MutationResult:
         ok = _parse_success(body)
-        return MutationResult(signature=ok.get("sig"))
+        return MutationResult(
+            signature=_require_signature(ok.get("sig"), policy, "merge")
+        )
 
-    return Request(url=url, parse=parse)
+    return Request(url=url, parse=parse, replayable=True)
 
 
 # ---- the generating variants ----
@@ -371,16 +478,19 @@ def merge_request_with_hash(callback: str, k1s: list[str], h: str) -> Request:
 
 
 def rotate_request(
-    callback: str, k1: str, rng: Callable[[], str] = generate_note_secret
+    callback: str,
+    k1: str,
+    rng: Callable[[], str] = generate_note_secret,
+    policy: Policy = DEFAULT_POLICY,
 ) -> Request:
     fresh = rng()
-    inner = rotate_request_with_hash(callback, k1, hash_k1(fresh))
+    inner = rotate_request_with_hash(callback, k1, hash_k1(fresh), policy)
 
     def parse(body: Any) -> RotateResult:
         result = inner.parse(body)
         return RotateResult(k1=fresh, signature=result.signature)
 
-    return Request(url=inner.url, parse=parse, new_secrets=[fresh])
+    return Request(url=inner.url, parse=parse, new_secrets=[fresh], replayable=True)
 
 
 def split_request(
@@ -388,11 +498,12 @@ def split_request(
     k1s: list[str],
     amount_msat: int,
     rng: Callable[[], str] = generate_note_secret,
+    policy: Policy = DEFAULT_POLICY,
 ) -> Request:
     fresh = rng()
     change = rng()
     inner = split_request_with_hash(
-        callback, k1s, amount_msat, hash_k1(fresh), hash_k1(change)
+        callback, k1s, amount_msat, hash_k1(fresh), hash_k1(change), policy
     )
 
     def parse(body: Any) -> SplitResult:
@@ -404,20 +515,25 @@ def split_request(
             change_signature=result.change_signature,
         )
 
-    return Request(url=inner.url, parse=parse, new_secrets=[fresh, change])
+    return Request(
+        url=inner.url, parse=parse, new_secrets=[fresh, change], replayable=True
+    )
 
 
 def merge_request(
-    callback: str, k1s: list[str], rng: Callable[[], str] = generate_note_secret
+    callback: str,
+    k1s: list[str],
+    rng: Callable[[], str] = generate_note_secret,
+    policy: Policy = DEFAULT_POLICY,
 ) -> Request:
     fresh = rng()
-    inner = merge_request_with_hash(callback, k1s, hash_k1(fresh))
+    inner = merge_request_with_hash(callback, k1s, hash_k1(fresh), policy)
 
     def parse(body: Any) -> RotateResult:
         result = inner.parse(body)
         return RotateResult(k1=fresh, signature=result.signature)
 
-    return Request(url=inner.url, parse=parse, new_secrets=[fresh])
+    return Request(url=inner.url, parse=parse, new_secrets=[fresh], replayable=True)
 
 
 # ---- minting ----

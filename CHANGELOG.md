@@ -13,6 +13,40 @@ and the adversarial mock mint.
 
 ### Design notes
 
+**Offline verification is mandatory, and this library insists on it.** LUD-25
+stopped treating a note signature as optional: a SERVICE MUST publish
+`mintPubkey` and MUST sign every note a rotate, split or merge mints. So
+`note_info_request` refuses a `withdrawRequest` publishing no `mintPubkey`, or
+one that is not a 33-byte compressed secp256k1 key, and a mutation the SERVICE
+confirms without signing raises the new `UnverifiableNote`.
+`Policy(require_signatures=False)` opts out.
+
+That exception carries the fresh secrets, and the reason matters: `status` was
+OK, so the mutation LANDED. The note exists at the hash the wallet disclosed
+and that secret is the only key to it, so enforcing the spec must never be the
+thing that strands the money.
+
+**A spent-or-unknown refusal from a mutation carries its secrets too.** At a
+SERVICE that has not implemented the replay rule below, a retried mutation is
+answered as an already-spent input - so that refusal is also what a mutation
+the SERVICE ALREADY applied looks like. `ServiceRejected` gained
+`new_secrets`, and `new_secrets_of(err)` reads them off all three families that
+can carry them. A refusal on policy grounds burned nothing and carries nothing.
+
+**A mutation whose answer was lost is re-sent, and usually completes.** LUD-25
+gained a "Retrying a mutation" section: a SERVICE MUST answer a byte-identical
+rotate, split or merge with the success it already returned. Both clients
+re-send - `mutation_retries`, default 1 - so a dropped connection resolves into
+a completed mutation rather than an unresolved maybe.
+
+A `Request` now says whether it is `replayable`, which only a rotate, split or
+merge is. A melt never is: it carries `pr`, is paid asynchronously and has no
+replay guarantee, so a second request could ask for a second payment. Only an
+ambiguous failure is retried, and the same `Request` goes out each time rather
+than a rebuilt one, because the replay is matched on the k1 set, `h`, `h2` and
+`amount` - a regenerated secret would make the retry a different mutation, and
+a second real burn.
+
 **Minting is comment-bound, and the payment preimage is only settlement proof.**
 The draft keyed a fresh note by the invoice's payment preimage until 31 August
 2026, when that fallback was removed outright: a preimage propagates to every
