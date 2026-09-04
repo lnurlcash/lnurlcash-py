@@ -16,6 +16,17 @@ from lnurlcash_kit.protocol import (
 )
 from lnurlcash_kit import (
     MintFee,
+    cash_domain_indices,
+    cash_node_from_hex,
+    cash_node_to_hex,
+    cash_secret_at,
+    derive_cash_child,
+    derive_cash_domain_node,
+    derive_cash_root,
+    derive_cash_secret,
+    derive_note_root,
+    derive_note_secret,
+    hash_k1,
     ProtocolError,
     RequestRefused,
     apply_mint_fee,
@@ -337,3 +348,65 @@ def test_verify_accepted(case):
 def test_verify_rejected(case):
     with pytest.raises(ProtocolError):
         verify_request("https://mint.example/verify/abc").parse(case["body"])
+
+
+# ---- derivation ----
+#
+# The two schemes a wallet may mint under. cash-derivation.json is the one
+# LUD-25 specifies and the one a new wallet uses; derivation.json is the
+# pre-spec HMAC scheme, kept because notes minted under it are still money.
+#
+# A disagreement with either file is a wallet that cannot restore what another
+# implementation of the same seed phrase minted, which is the whole reason
+# these vectors exist rather than each library testing itself.
+
+
+def test_cash_derivation_scheme_is_the_one_this_library_implements():
+    scheme = load_vectors("cash-derivation.json")["scheme"]
+    assert scheme["purpose"] == "m/139'"
+    assert scheme["secretPath"] == "m/139'/d1/d2/d3/d4/i'"
+    # The one thing an implementation can silently get wrong: d1..d4 are raw
+    # uint32, hardened only where they happen to land at or above 2^31.
+    assert scheme["hardenedByMagnitudeOnly"] is True
+
+
+def test_cash_derivation_matches_bip32_vector_1():
+    # BIP-32's own published vector, so a failure here says CKDpriv is wrong
+    # rather than the LUD-25 path above it. The chain alternates hardened and
+    # unhardened, which is exactly the pair of legs the domain levels land on.
+    steps = load_vectors("cash-derivation.json")["bip32Vector1"]
+    node = cash_node_from_hex(steps[0]["node"])
+    for step in steps[1:]:
+        node = derive_cash_child(node, step["index"])
+        assert cash_node_to_hex(node) == step["node"]
+
+
+@pytest.mark.parametrize(
+    "case", _cases("cash-derivation.json", "cases"), ids=lambda c: c["name"]
+)
+def test_cash_derivation(case):
+    seed = bytes.fromhex(case["seedHex"])
+    root = derive_cash_root(seed)
+    assert cash_node_to_hex(root) == case["cashRoot"]
+    assert list(cash_domain_indices(root, case["host"])) == case["domainIndices"]
+
+    domain_node = derive_cash_domain_node(root, case["host"])
+    assert cash_node_to_hex(domain_node) == case["domainNode"]
+
+    assert derive_cash_secret(root, case["host"], case["index"]) == case["k1"]
+    # The hardware-signer path: given only this mint's subtree, with no seed
+    # and no elliptic curve, every note index still resolves.
+    assert cash_secret_at(domain_node, case["index"]) == case["k1"]
+    assert hash_k1(case["k1"]) == case["noteId"]
+
+
+def test_legacy_derivation_scheme():
+    assert load_vectors("derivation.json")["scheme"]["rootKey"] == "lnurlcash-note-v1"
+
+
+@pytest.mark.parametrize("case", _cases("derivation.json", "cases"), ids=lambda c: c["name"])
+def test_legacy_derivation(case):
+    root = derive_note_root(bytes.fromhex(case["seedHex"]))
+    k1 = derive_note_secret(root, case["host"], case["index"])
+    assert k1 == case["k1"]
+    assert hash_k1(k1) == case["noteId"]

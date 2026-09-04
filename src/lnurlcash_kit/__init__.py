@@ -43,6 +43,7 @@ from .fees import (
     parse_mint_fee,
 )
 from .note import (
+    build_note_info_url_by_hash,
     build_note_url,
     is_valid_note_input,
     note_declared_amount,
@@ -67,7 +68,25 @@ from .protocol import (
     VerifyResult,
     WithdrawRequestInfo,
 )
-from .secrets import generate_note_secret, hash_k1, is_preimage
+from .cash import (
+    CashNode,
+    CashSecretSource,
+    cash_domain_indices,
+    cash_node_from_hex,
+    cash_node_to_hex,
+    cash_secret_at,
+    derive_cash_child,
+    derive_cash_domain_node,
+    derive_cash_root,
+    derive_cash_secret,
+)
+from .secrets import (
+    derive_note_root,
+    derive_note_secret,
+    generate_note_secret,
+    hash_k1,
+    is_preimage,
+)
 from .signature import (
     note_signature_digest,
     note_signature_message,
@@ -111,6 +130,7 @@ __all__ = [
     "format_fee_percent",
     "gross_up_for_mint_fee",
     "parse_mint_fee",
+    "build_note_info_url_by_hash",
     "build_note_url",
     "is_valid_note_input",
     "note_declared_amount",
@@ -135,6 +155,18 @@ __all__ = [
     "generate_note_secret",
     "hash_k1",
     "is_preimage",
+    "CashNode",
+    "CashSecretSource",
+    "cash_domain_indices",
+    "cash_node_from_hex",
+    "cash_node_to_hex",
+    "cash_secret_at",
+    "derive_cash_child",
+    "derive_cash_domain_node",
+    "derive_cash_root",
+    "derive_cash_secret",
+    "derive_note_root",
+    "derive_note_secret",
     "note_signature_digest",
     "note_signature_message",
     "verify_note_signature",

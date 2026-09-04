@@ -105,6 +105,25 @@ class WithdrawRequestInfo:
 
 
 @dataclass(frozen=True)
+class NoteInfoByHash:
+    """What a hash lookup returns.
+
+    Deliberately NOT :class:`WithdrawRequestInfo`: that type's ``k1`` is the
+    bearer secret, and the whole point of asking by hash is that the caller
+    already holds it and the SERVICE never sends it back. A conforming SERVICE
+    omits ``k1`` here (LUD-03's convenience of echoing the queried value has
+    nothing to echo), so a type promising one would be promising something no
+    answer contains.
+    """
+
+    callback: str
+    max_withdrawable: int
+    min_withdrawable: int = 0
+    default_description: str | None = None
+    mint_pubkey: str | None = None
+
+
+@dataclass(frozen=True)
 class MintAddressInfo:
     callback: str
     pay_link: str
@@ -293,6 +312,73 @@ def note_info_request(url: str, policy: Policy = DEFAULT_POLICY) -> Request:
         return WithdrawRequestInfo(
             callback=callback,
             k1=k1.lower(),
+            max_withdrawable=maximum,
+            min_withdrawable=minimum or 0,
+            default_description=body.get("defaultDescription"),
+            mint_pubkey=mint_pubkey.strip().lower()
+            if isinstance(mint_pubkey, str)
+            else None,
+        )
+
+    return Request(url=request_url, parse=parse)
+
+
+def note_info_by_hash_request(
+    withdraw_link: str, h: str, policy: Policy = DEFAULT_POLICY
+) -> Request:
+    """The informational GET for a note named by its hash, so nothing
+    spendable goes on the wire (LUD-25, "Checking a note without exposing it").
+
+    What a restore walk uses: a walk queries a whole gap window of indices the
+    wallet has not minted into yet, and asking by secret would publish exactly
+    the secrets it is about to mint under.
+
+    A rejection means nothing on its own. A SERVICE that does not index by hash
+    must answer as it would for an unknown ``k1``, and so must one answering
+    for a note that was burned, so only a positive answer is evidence.
+
+    Differs from :func:`note_info_request` in exactly two places, both because
+    there was no secret in the request: ``k1`` is not required in the response,
+    and there is no echo to check. The shape and the mandatory ``mintPubkey``
+    are enforced identically - a note nobody can verify offline is no more
+    acceptable when it was looked up privately.
+    """
+    from .note import build_note_info_url_by_hash
+
+    request_url = build_note_info_url_by_hash(withdraw_link, h)
+
+    def parse(body: Any) -> NoteInfoByHash:
+        try:
+            _reject_error(body)
+        except ServiceRejected as err:
+            raise classify_note_error(err.reason) from None
+        if not isinstance(body, dict) or body.get("tag") != "withdrawRequest":
+            raise ProtocolError("Not a withdrawRequest (unexpected response).")
+        callback = body.get("callback")
+        maximum = body.get("maxWithdrawable")
+        minimum = body.get("minWithdrawable", 0)
+        if not isinstance(callback, str):
+            raise ProtocolError("Not a withdrawRequest (unexpected response).")
+        if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 0:
+            raise ProtocolError("Not a withdrawRequest (unexpected response).")
+        if minimum is not None and (
+            not isinstance(minimum, int)
+            or isinstance(minimum, bool)
+            or minimum < 0
+            or minimum > maximum
+        ):
+            raise ProtocolError("Not a withdrawRequest (unexpected response).")
+        mint_pubkey = body.get("mintPubkey")
+        if policy.require_signatures and not is_compressed_pubkey(mint_pubkey):
+            raise ProtocolError(
+                "This service publishes no mintPubkey, so its notes cannot be "
+                "verified offline (LUD-25 requires one)."
+                if mint_pubkey is None
+                else "This service published a mintPubkey that is not a "
+                "33-byte compressed secp256k1 key."
+            )
+        return NoteInfoByHash(
+            callback=callback,
             max_withdrawable=maximum,
             min_withdrawable=minimum or 0,
             default_description=body.get("defaultDescription"),
