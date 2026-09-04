@@ -22,6 +22,7 @@ from .errors import (
     NoteUnknown,
     RequestRefused,
     UnverifiableNote,
+    new_secrets_of,
 )
 from .note import with_new_k1
 from .protocol import (
@@ -292,7 +293,17 @@ class LnurlcashClient(_Base):
         )
         try:
             rotated = self.rotate_note(info.callback, k1)
-        except Exception:
+        except LnurlcashError as err:
+            # Best-effort covers a refusal that burned nothing. It must not
+            # cover a rotate that MAY HAVE LANDED: the SERVICE would then have
+            # burned this k1 and minted the rotated note under h, whose only
+            # copy is the fresh secret carried on the error. Returning the old
+            # k1 there hands back a dead secret and drops the live one.
+            # new_secrets_of is non-empty for exactly those cases - ambiguous,
+            # unverifiable, or a spent/unknown refusal, which is also what an
+            # already-applied mutation looks like asked a second time.
+            if isinstance(err, AmbiguousMint) or new_secrets_of(err):
+                raise
             return (k1, info.max_withdrawable, signature, info.callback)
         return (rotated.k1, info.max_withdrawable, rotated.signature, info.callback)
 
@@ -431,6 +442,10 @@ class AsyncLnurlcashClient(_Base):
         )
         try:
             rotated = await self.rotate_note(info.callback, k1)
-        except Exception:
+        except LnurlcashError as err:
+            # See the synchronous settle_note: a rotate that may have landed
+            # must not be reported as a settled note.
+            if isinstance(err, AmbiguousMint) or new_secrets_of(err):
+                raise
             return (k1, info.max_withdrawable, signature, info.callback)
         return (rotated.k1, info.max_withdrawable, rotated.signature, info.callback)
