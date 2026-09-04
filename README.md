@@ -39,8 +39,10 @@ print(info.max_withdrawable, "msat")
 
 fresh = client.rotate_note(info.callback, info.k1)   # that GET exposed the secret
 
-if info.mint_pubkey and fresh.signature:   # check it, without asking anyone
-    verify_note_signature(fresh.k1, info.max_withdrawable, fresh.signature, info.mint_pubkey)
+# check it, without asking anyone. Both are guaranteed: LUD-25 requires the
+# mint to publish mint_pubkey and to sign what it mints, and this library
+# refuses a mint that does neither.
+verify_note_signature(fresh.k1, info.max_withdrawable, fresh.signature, info.mint_pubkey)
 ```
 
 `AsyncLnurlcashClient` has the identical surface with `await`. Both accept
@@ -98,18 +100,45 @@ except AmbiguousMutation as err:
 
 `RequestRefused` is the opposite and safe: nothing left the process.
 
-**3. Your HTTP stack must not retry.** Every mutation is a GET, HTTP treats GET
-as idempotent, and an LNURLcash mutation is not — the first attempt burns the
-input. A retried mutation is answered "already spent", which reads as a
-*definitive* rejection, so the fresh secret gets discarded along with the note
-the service just minted. `httpx` does not retry by default, which is what this
-library needs; if you pass your own client, do not configure a retrying
-transport, and exclude these requests from any retry decorator.
-
-This is not hypothetical: the same hazard broke the
-[Kotlin](https://github.com/TheCryptoDonkey/lnurlcash-kotlin) and
-[Go](https://github.com/TheCryptoDonkey/lnurlcash-go) siblings during
+**3. A retried mutation is now a replay, not a double spend.** Every mutation
+is a GET, HTTP treats GET as idempotent, and an LNURLcash mutation is not — the
+first attempt burns the input. For most of this draft's life that was the
+sharpest edge in the protocol: a stack that resent a dropped GET got "already
+spent" for the second attempt, which reads as a *definitive* rejection, so the
+fresh secret got discarded along with the note the service had just minted. The
+hazard broke the [Kotlin](https://github.com/TheCryptoDonkey/lnurlcash-kotlin)
+and [Go](https://github.com/TheCryptoDonkey/lnurlcash-go) siblings during
 development, by two different mechanisms.
+
+LUD-25 closed it. A service MUST answer a byte-identical rotate, split or merge
+with the success it already returned, signature and all. So this library
+re-sends one whose answer was lost, and an unstoppable transport retry is now
+simply invisible:
+
+```python
+# the connection dropped after the mint applied this. It completes anyway.
+fresh = client.rotate_note(callback, old_k1)
+```
+
+`mutation_retries` sets how many times (default 1; `0` restores the old
+give-up-at-once behaviour). Only rotate, split and merge are re-sent — never a
+melt, which carries `pr`, is paid asynchronously and has no replay guarantee —
+and only an ambiguous failure, never a refusal the service actually considered.
+The re-sent request is byte-identical, because the replay is matched on the k1
+set, `h`, `h2` and `amount`.
+
+`httpx` does not retry by default, which is still what this library wants: a
+deliberate retry it counts is a different thing from an invisible one it does
+not. If you pass your own client, do not configure a retrying transport.
+
+**3b. Offline verification is mandatory.** A service MUST publish `mintPubkey`
+and MUST sign every note a rotate, split or merge mints. `fetch_note_info`
+raises `ProtocolError` for a `withdrawRequest` publishing no valid one, and a
+mutation the service confirms but does not sign raises `UnverifiableNote` —
+which **carries the fresh secrets**, because the mutation landed and the note
+it minted is real. Read them with `new_secrets_of` and persist them before
+anything else. Pass `policy=Policy(require_signatures=False)` to deal with a
+mint that predates the requirement.
 
 **4. A melt's `OK` means "in flight", not "spent".** The service pays
 asynchronously and only burns the note once the payment settles, restoring it
@@ -135,9 +164,15 @@ invoice. First rotater wins.
 | `NoteUnknown` | the service does not recognise it. |
 | `AmbiguousMint` | outcome **unknown**. Assume nothing. |
 | `AmbiguousMutation` | as above, carrying `.new_secrets`. |
-| `ProtocolError` | a non-mutating response did not match the spec. |
+| `UnverifiableNote` | the mutation **landed** and came back unsigned. The note is real; carries `.new_secrets`. |
+| `ProtocolError` | a non-mutating response did not match the spec, including a `withdrawRequest` with no `mintPubkey`. |
 
 Branch on the class, never on the message.
+
+`new_secrets_of(err)` reads the fresh secrets off any exception that could
+describe a mutation the service applied: ambiguous, unverifiable, or a
+spent-or-unknown refusal. A refusal on policy grounds burned nothing and
+carries nothing.
 
 ## Scope
 

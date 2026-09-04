@@ -18,16 +18,20 @@ from .errors import (
     AmbiguousMint,
     AmbiguousMutation,
     NoteSpent,
+    LnurlcashError,
     NoteUnknown,
     RequestRefused,
+    UnverifiableNote,
 )
 from .note import with_new_k1
 from .protocol import (
+    DEFAULT_POLICY,
     InvoiceResult,
     MeltResult,
     MintAddressInfo,
     MutationResult,
     PayRequestInfo,
+    Policy,
     Request,
     RotateResult,
     SplitResult,
@@ -47,6 +51,8 @@ class _Base:
         timeout: float = DEFAULT_TIMEOUT,
         offline: bool = False,
         rng: Callable[[], str] = generate_note_secret,
+        policy: Policy = DEFAULT_POLICY,
+        mutation_retries: int = 1,
     ) -> None:
         #: Bounded wait. Without one a hung SERVICE blocks the caller forever.
         self.timeout = timeout
@@ -58,6 +64,19 @@ class _Base:
         #: RNG or a deterministic test - and see secrets.generate_note_secret
         #: for what a caller takes on by doing so.
         self.rng = rng
+        #: What this client insists a SERVICE does. The default requires the
+        #: offline verification LUD-25 makes mandatory.
+        self.policy = policy
+        #: How many times to re-send a rotate, split or merge whose outcome the
+        #: transport lost. LUD-25 requires a SERVICE to answer a byte-identical
+        #: retry with the original success ("Retrying a mutation"), so
+        #: re-sending resolves the ambiguity rather than compounding it: a
+        #: conforming SERVICE replays, and one that refuses leaves the caller
+        #: exactly where an un-retried failure would have.
+        #:
+        #: Only ever applied to a request marked ``replayable``, which a melt
+        #: never is. Zero gives up on the first ambiguous answer.
+        self.mutation_retries = max(0, mutation_retries)
 
     def _guard(self, url: str) -> None:
         if self.offline:
@@ -87,13 +106,40 @@ class _Base:
             "Failed to reach the service - it may be offline or unreachable."
         )
 
+    def _attempts(self, request: Request) -> int:
+        """How many times this request may be re-sent after the first try.
+
+        Only a rotate, split or merge - the mutations LUD-25's replay rule
+        covers, which is what makes re-sending safe rather than a second burn.
+        A read has nothing to resolve by asking again, and a melt has no replay
+        guarantee at all.
+
+        The same Request goes out each time rather than a rebuilt one: the
+        replay is matched on the k1 set, h, h2 and amount, so a regenerated
+        secret would make the retry a DIFFERENT mutation.
+        """
+        return self.mutation_retries if request.replayable else 0
+
     @staticmethod
-    def _preserve(request: Request, err: AmbiguousMint) -> AmbiguousMint:
-        """A mutation whose outcome is unknown must carry its fresh secrets
-        out with it: if the request did land, they are the only copies of the
-        notes the SERVICE minted."""
-        if request.new_secrets:
+    def _preserve(request: Request, err: BaseException) -> BaseException:
+        """Attach a mutation's fresh secrets to whatever it failed with.
+
+        Three families need them. An ambiguous outcome, because the request may
+        have landed and they would then be the only copies of the notes the
+        SERVICE minted. An unverifiable one, because it certainly landed. And a
+        spent-or-unknown refusal, because at a SERVICE that has not implemented
+        LUD-25's replay rule that refusal is also what an already-applied
+        mutation looks like.
+
+        A refusal on policy grounds burned nothing, so it carries nothing and
+        the caller may discard its staged records at once.
+        """
+        if not request.new_secrets:
+            return err
+        if isinstance(err, AmbiguousMint):
             return AmbiguousMutation(str(err), request.new_secrets)
+        if isinstance(err, (UnverifiableNote, NoteSpent, NoteUnknown)):
+            err.new_secrets = request.new_secrets
         return err
 
 
@@ -105,22 +151,31 @@ class LnurlcashClient(_Base):
         self._client = client
         self._owned = client is None
 
+    def _attempt(self, client: httpx.Client, request: Request) -> Any:
+        try:
+            response = client.get(request.url)
+        except Exception as err:
+            raise self._preserve(request, self._transport_failure(err)) from err
+        try:
+            body = self._decode(response)
+        except AmbiguousMint as err:
+            raise self._preserve(request, err) from None
+        try:
+            return request.parse(body)
+        except LnurlcashError as err:
+            raise self._preserve(request, err) from None
+
     def _run(self, request: Request) -> Any:
         self._guard(request.url)
         client = self._client or httpx.Client(timeout=self.timeout)
         try:
-            try:
-                response = client.get(request.url)
-            except Exception as err:
-                raise self._preserve(request, self._transport_failure(err)) from err
-            try:
-                body = self._decode(response)
-            except AmbiguousMint as err:
-                raise self._preserve(request, err) from None
-            try:
-                return request.parse(body)
-            except AmbiguousMint as err:
-                raise self._preserve(request, err) from None
+            for attempt in range(self._attempts(request) + 1):
+                try:
+                    return self._attempt(client, request)
+                except AmbiguousMint:
+                    if attempt >= self._attempts(request):
+                        raise
+            raise AssertionError("unreachable")  # pragma: no cover
         finally:
             if self._owned:
                 client.close()
@@ -128,7 +183,7 @@ class LnurlcashClient(_Base):
     # ---- operations ----
 
     def fetch_note_info(self, url: str) -> WithdrawRequestInfo:
-        return self._run(protocol.note_info_request(url))
+        return self._run(protocol.note_info_request(url, self.policy))
 
     def fetch_mint_address(self, url: str) -> MintAddressInfo:
         return self._run(protocol.mint_address_request(url))
@@ -137,30 +192,44 @@ class LnurlcashClient(_Base):
         return self._run(protocol.melt_request(callback, k1, pr))
 
     def rotate_note(self, callback: str, k1: str) -> RotateResult:
-        return self._run(protocol.rotate_request(callback, k1, rng=self.rng))
+        return self._run(
+            protocol.rotate_request(callback, k1, rng=self.rng, policy=self.policy)
+        )
 
     def rotate_note_with_hash(self, callback: str, k1: str, h: str) -> MutationResult:
-        return self._run(protocol.rotate_request_with_hash(callback, k1, h))
+        return self._run(
+            protocol.rotate_request_with_hash(callback, k1, h, self.policy)
+        )
 
     def split_note(
         self, callback: str, k1s: list[str], amount_msat: int
     ) -> SplitResult:
-        return self._run(protocol.split_request(callback, k1s, amount_msat, rng=self.rng))
+        return self._run(
+            protocol.split_request(
+                callback, k1s, amount_msat, rng=self.rng, policy=self.policy
+            )
+        )
 
     def split_note_with_hash(
         self, callback: str, k1s: list[str], amount_msat: int, h: str, h2: str
     ) -> MutationResult:
         return self._run(
-            protocol.split_request_with_hash(callback, k1s, amount_msat, h, h2)
+            protocol.split_request_with_hash(
+                callback, k1s, amount_msat, h, h2, self.policy
+            )
         )
 
     def merge_notes(self, callback: str, k1s: list[str]) -> RotateResult:
-        return self._run(protocol.merge_request(callback, k1s, rng=self.rng))
+        return self._run(
+            protocol.merge_request(callback, k1s, rng=self.rng, policy=self.policy)
+        )
 
     def merge_notes_with_hash(
         self, callback: str, k1s: list[str], h: str
     ) -> MutationResult:
-        return self._run(protocol.merge_request_with_hash(callback, k1s, h))
+        return self._run(
+            protocol.merge_request_with_hash(callback, k1s, h, self.policy)
+        )
 
     def fetch_pay_request(self, url: str) -> PayRequestInfo:
         return self._run(protocol.pay_request_request(url))
@@ -238,28 +307,37 @@ class AsyncLnurlcashClient(_Base):
         self._client = client
         self._owned = client is None
 
+    async def _attempt(self, client: httpx.AsyncClient, request: Request) -> Any:
+        try:
+            response = await client.get(request.url)
+        except Exception as err:
+            raise self._preserve(request, self._transport_failure(err)) from err
+        try:
+            body = self._decode(response)
+        except AmbiguousMint as err:
+            raise self._preserve(request, err) from None
+        try:
+            return request.parse(body)
+        except LnurlcashError as err:
+            raise self._preserve(request, err) from None
+
     async def _run(self, request: Request) -> Any:
         self._guard(request.url)
         client = self._client or httpx.AsyncClient(timeout=self.timeout)
         try:
-            try:
-                response = await client.get(request.url)
-            except Exception as err:
-                raise self._preserve(request, self._transport_failure(err)) from err
-            try:
-                body = self._decode(response)
-            except AmbiguousMint as err:
-                raise self._preserve(request, err) from None
-            try:
-                return request.parse(body)
-            except AmbiguousMint as err:
-                raise self._preserve(request, err) from None
+            for attempt in range(self._attempts(request) + 1):
+                try:
+                    return await self._attempt(client, request)
+                except AmbiguousMint:
+                    if attempt >= self._attempts(request):
+                        raise
+            raise AssertionError("unreachable")  # pragma: no cover
         finally:
             if self._owned:
                 await client.aclose()
 
     async def fetch_note_info(self, url: str) -> WithdrawRequestInfo:
-        return await self._run(protocol.note_info_request(url))
+        return await self._run(protocol.note_info_request(url, self.policy))
 
     async def fetch_mint_address(self, url: str) -> MintAddressInfo:
         return await self._run(protocol.mint_address_request(url))
@@ -268,34 +346,46 @@ class AsyncLnurlcashClient(_Base):
         return await self._run(protocol.melt_request(callback, k1, pr))
 
     async def rotate_note(self, callback: str, k1: str) -> RotateResult:
-        return await self._run(protocol.rotate_request(callback, k1, rng=self.rng))
+        return await self._run(
+            protocol.rotate_request(callback, k1, rng=self.rng, policy=self.policy)
+        )
 
     async def rotate_note_with_hash(
         self, callback: str, k1: str, h: str
     ) -> MutationResult:
-        return await self._run(protocol.rotate_request_with_hash(callback, k1, h))
+        return await self._run(
+            protocol.rotate_request_with_hash(callback, k1, h, self.policy)
+        )
 
     async def split_note(
         self, callback: str, k1s: list[str], amount_msat: int
     ) -> SplitResult:
         return await self._run(
-            protocol.split_request(callback, k1s, amount_msat, rng=self.rng)
+            protocol.split_request(
+                callback, k1s, amount_msat, rng=self.rng, policy=self.policy
+            )
         )
 
     async def split_note_with_hash(
         self, callback: str, k1s: list[str], amount_msat: int, h: str, h2: str
     ) -> MutationResult:
         return await self._run(
-            protocol.split_request_with_hash(callback, k1s, amount_msat, h, h2)
+            protocol.split_request_with_hash(
+                callback, k1s, amount_msat, h, h2, self.policy
+            )
         )
 
     async def merge_notes(self, callback: str, k1s: list[str]) -> RotateResult:
-        return await self._run(protocol.merge_request(callback, k1s, rng=self.rng))
+        return await self._run(
+            protocol.merge_request(callback, k1s, rng=self.rng, policy=self.policy)
+        )
 
     async def merge_notes_with_hash(
         self, callback: str, k1s: list[str], h: str
     ) -> MutationResult:
-        return await self._run(protocol.merge_request_with_hash(callback, k1s, h))
+        return await self._run(
+            protocol.merge_request_with_hash(callback, k1s, h, self.policy)
+        )
 
     async def fetch_pay_request(self, url: str) -> PayRequestInfo:
         return await self._run(protocol.pay_request_request(url))
