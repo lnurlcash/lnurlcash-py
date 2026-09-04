@@ -562,3 +562,27 @@ def test_a_lying_service_cannot_inflate_past_what_it_signed(mint, client):
     # not verify - an offline holder catches this without asking anyone
     assert not verify_note_signature(k1, info.max_withdrawable, signature, m.pubkey)
     assert verify_note_signature(k1, 21000, signature, m.pubkey)
+
+
+def test_settle_surfaces_a_rotate_that_may_have_applied(mint):
+    """A rotate whose answer is lost must not come back as a settled note.
+
+    If the request landed, the SERVICE burned that k1 and minted the rotated
+    note under h, and the fresh secret carried on the error is the only copy
+    of it anywhere. This used to catch bare ``Exception`` and return the
+    burned k1, so the caller kept a dead secret and the live one was dropped.
+    """
+    m = mint(dropAfterMutation=True)
+    # Retrying off, so the ambiguity survives to the caller. With the default
+    # the SERVICE replays the original success per LUD-25's "Retrying a
+    # mutation" and this resolves cleanly, which is what that rule is for.
+    client = LnurlcashClient(mutation_retries=0)
+    k1 = secret()
+    m.credit(k1, 21000)
+
+    with pytest.raises(AmbiguousMint) as caught:
+        client.settle_note(m.note_url(k1), k1, 0)
+
+    fresh = new_secrets_of(caught.value)
+    assert len(fresh) == 1, "the fresh secret did not survive the error"
+    assert fresh[0] != k1, "the secret carried out is the one that was burned"
