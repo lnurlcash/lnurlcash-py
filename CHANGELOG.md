@@ -5,6 +5,20 @@ carry breaking changes; pin an exact version.
 
 ## 0.1.0 — unreleased
 
+### Three more fields off a mint address
+
+`mint_address_request` reads `nodeUris`, `sunsetDate` and
+`outstandingNotesMsat`, which the reference mint publishes and this dropped.
+
+- `node_uris` — every address the SERVICE's node announces. `node_uri` is the
+  first of them; a node behind Tor as well as clearnet has more. `None` rather
+  than an empty tuple when there are none.
+- `sunset_date` — the day the SERVICE plans to close, ISO-8601. Validated with
+  `date.fromisoformat` and dropped otherwise: the one thing a WALLET does with
+  this is show it to a holder, and a wrong date is worse than no date.
+- `outstanding_notes_msat` — what the SERVICE says it owes. `0` and `None` are
+  different answers.
+
 ### Seed-recoverable note secrets, and the private lookup a restore needs
 
 - `lnurlcash_kit.cash`: LUD-25's `m/139'` scheme. `derive_cash_root`,

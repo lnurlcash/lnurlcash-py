@@ -14,6 +14,7 @@ directly and never touch the clients at all.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any, Callable
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -140,6 +141,24 @@ class MintAddressInfo:
     node_capacity_msat: int | None = None
     node_num_channels: int | None = None
     node_num_peers: int | None = None
+    #: every address the SERVICE's node announces, each already
+    #: ``node_key@host:port``. ``node_uri`` is the first of them; a node behind
+    #: Tor as well as clearnet has more, and a caller that can only reach the
+    #: other one needs the whole list. ``None``, never an empty list, when the
+    #: SERVICE announces nothing
+    node_uris: tuple[str, ...] | None = None
+    #: the day the SERVICE plans to close, ISO-8601 (``"2026-12-31"``).
+    #: Advance warning while there is still time to spend, deliberately not the
+    #: same thing as a mint that has already stopped minting. Nothing enforces
+    #: it and nothing verifies it, so it is a prompt to move notes, never a
+    #: deadline to compute against. ``None`` when the SERVICE published none, or
+    #: published something that is not a real calendar day
+    sunset_date: str | None = None
+    #: what the SERVICE says it owes, msat: every note it has issued and not
+    #: burned. Its own claim about its own database, with nothing to check it
+    #: against, so read it next to what the node holds rather than on its own.
+    #: ``0`` and ``None`` are different answers
+    outstanding_notes_msat: int | None = None
 
 
 @dataclass(frozen=True)
@@ -238,6 +257,34 @@ def _optional_int(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value
+
+
+def _optional_str_tuple(value: Any) -> tuple[str, ...] | None:
+    """Non-empty strings only, and None rather than an empty tuple for a list
+    that had none: a caller testing ``is not None`` and one testing ``len()``
+    have to reach the same conclusion about a SERVICE that announced nothing."""
+    if not isinstance(value, list):
+        return None
+    entries = tuple(item for item in value if isinstance(item, str) and item)
+    return entries or None
+
+
+def _optional_iso_date(value: Any) -> str | None:
+    """A calendar day, ``YYYY-MM-DD``, and nothing else.
+
+    A timestamp, a locale-formatted date or a typo is dropped rather than
+    passed on, because the one thing a WALLET does with this is put it in
+    front of a holder and a wrong date there is worse than no date.
+    ``date.fromisoformat`` refuses 2026-02-31 outright rather than rolling it
+    forward to March, and the re-format catches the spellings it accepts that
+    are not this one."""
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError:
+        return None
+    return value if parsed.isoformat() == value else None
 
 
 def _reject_error(body: Any) -> None:
@@ -417,6 +464,9 @@ def mint_address_request(url: str) -> Request:
             node_capacity_msat=_optional_int(body.get("nodeCapacity")),
             node_num_channels=_optional_int(body.get("nodeNumChannels")),
             node_num_peers=_optional_int(body.get("nodeNumPeers")),
+            node_uris=_optional_str_tuple(body.get("nodeUris")),
+            sunset_date=_optional_iso_date(body.get("sunsetDate")),
+            outstanding_notes_msat=_optional_int(body.get("outstandingNotesMsat")),
         )
 
     return Request(url=url, parse=parse)

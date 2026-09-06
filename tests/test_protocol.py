@@ -28,6 +28,7 @@ from lnurlcash_kit import (
     new_secrets_of,
     verify_note_signature,
 )
+from lnurlcash_kit.protocol import mint_address_request
 
 
 def secret() -> str:
@@ -586,3 +587,67 @@ def test_settle_surfaces_a_rotate_that_may_have_applied(mint):
     fresh = new_secrets_of(caught.value)
     assert len(fresh) == 1, "the fresh secret did not survive the error"
     assert fresh[0] != k1, "the secret carried out is the one that was burned"
+
+
+# The three fields the reference mint publishes on its discovery document.
+# Parsed straight from a body rather than through the mock mint: the mock does
+# not emit them, and what needs grading here is the mapping and what it
+# refuses, not another round trip.
+
+
+def _mint_address(**extra):
+    body = {
+        "tag": "withdrawRequest",
+        "callback": "https://mint.example/w/cb",
+        "payLink": "https://mint.example/.well-known/lnurlp/mint",
+        "minWithdrawable": 1000,
+        "maxWithdrawable": 100_000_000,
+        **extra,
+    }
+    return mint_address_request("https://mint.example/.well-known/lnurlw/mint").parse(body)
+
+
+def test_reads_every_address_the_node_announces():
+    clearnet = "02aa@2.29.14.244:9735"
+    onion = "02aa@abcdefghijklmnop.onion:9735"
+    address = _mint_address(nodeUri=clearnet, nodeUris=[clearnet, onion])
+    assert address.node_uris == (clearnet, onion)
+    # the singular field is unchanged and still the first address
+    assert address.node_uri == clearnet
+
+
+def test_an_announced_nothing_is_none_not_empty():
+    # A caller testing `is not None` and one testing len() have to reach the
+    # same conclusion about a mint that announced nothing.
+    assert _mint_address().node_uris is None
+    assert _mint_address(nodeUris=[]).node_uris is None
+    assert _mint_address(nodeUris="not a list").node_uris is None
+    assert _mint_address(nodeUris=[1, "a", "", None]).node_uris == ("a",)
+
+
+def test_a_closing_date_is_a_calendar_day_or_nothing():
+    assert _mint_address(sunsetDate="2026-12-31").sunset_date == "2026-12-31"
+    assert _mint_address(sunsetDate="2028-02-29").sunset_date == "2028-02-29"
+    assert _mint_address().sunset_date is None
+    # A wallet showing a holder a closing date off an unchecked string is
+    # worse than showing nothing, so anything that is not a real day goes.
+    for bad in (
+        "31/12/2026",
+        "2026-12-31T09:00:00Z",
+        "20261231",
+        "2026-02-31",
+        "2026-02-29",
+        "2026-13-01",
+        20261231,
+        None,
+    ):
+        assert _mint_address(sunsetDate=bad).sunset_date is None
+
+
+def test_what_a_mint_says_it_owes_keeps_zero_distinct_from_silence():
+    assert _mint_address(outstandingNotesMsat=48_000).outstanding_notes_msat == 48_000
+    # "owes nothing" and "will not say" are different things to know about a
+    # custodian
+    assert _mint_address(outstandingNotesMsat=0).outstanding_notes_msat == 0
+    assert _mint_address().outstanding_notes_msat is None
+    assert _mint_address(outstandingNotesMsat="48000").outstanding_notes_msat is None
