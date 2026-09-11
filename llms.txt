@@ -129,6 +129,8 @@ sign_note_ownership(sk) -> 65 bytes r || s || recid, RFC6979, low-S
 recover_note_ownership_pubkey(sig) -> x-only pk | None
 note_id_of(k1) -> sha256 hex for a hex k1, recovered pk hex for a ck1, else None
   One note has MANY valid ck1 strings. Compare notes by this, never by k1.
+  fetch_note_info's echo check does: another ck1 for the same note passes,
+  a different note is refused.
 note_lookup_of(k1) -> the hash, or the cp1 for a ck1. Pass it to
   note_info_by_hash_request: a cp1 goes as ?p=, a hash as ?h=. The answer's
   .signature is the note's cs1.

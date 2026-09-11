@@ -244,6 +244,8 @@ Three things worth knowing:
 - **One note, many `ck1` strings.** This library's `ck1` for a key is the same
   every time, because RFC6979 makes it so, but any valid signature by `sk`
   spends the note. Compare notes by `note_id_of`, never by the string.
+  `fetch_note_info` does: a mint that echoes another valid `ck1` for the same
+  note has named that note, and only a different note is refused.
 
 **A branch rooted in a Nostr key.** This one is ours, not LUD-25's. A holder
 with no BIP-39 words, such as a hardware signer that keeps only its identity

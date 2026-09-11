@@ -30,7 +30,7 @@ from .errors import (
 from .fees import MintFee, parse_mint_fee
 from .bolt11 import decode_bolt11_amount_msat
 from .note import note_k1
-from .recoverable import is_cp1
+from .recoverable import is_cp1, note_id_of
 from .secrets import generate_note_secret, hash_k1, is_preimage
 from .urls import is_allowed_service_url
 
@@ -317,6 +317,22 @@ def _reject_error(body: Any) -> None:
 # ---- the informational GET ----
 
 
+def _same_note(a: str, b: str) -> bool:
+    """Whether two k1s name one note.
+
+    A Part 1 secret has one spelling, but a Part 2 note has as many valid ck1s
+    as a signer has nonces - and anyone can flip a signature to its high-S
+    twin - so a SERVICE echoing a different ck1 that recovers to the same key
+    has named the same note, not a different one. Same rule as the Go kit's
+    ParseNoteInfo. Anything that is not a note at all still has to match as
+    text, as it always did.
+    """
+    if a.strip().lower() == b.strip().lower():
+        return True
+    id_a, id_b = note_id_of(a), note_id_of(b)
+    return id_a is not None and id_a == id_b
+
+
 def note_info_request(url: str, policy: Policy = DEFAULT_POLICY) -> Request:
     """LUD-03 step one. Never burns, rotates or alters the note.
 
@@ -354,8 +370,9 @@ def note_info_request(url: str, policy: Policy = DEFAULT_POLICY) -> Request:
         # Spec MUST: the response's k1 is the bearer secret itself, never a
         # derived or opaque id. A SERVICE returning something else for the k1
         # it was queried with is non-compliant - or the note was rotated by
-        # somebody else, which matters more.
-        if queried and k1.lower() != queried:
+        # somebody else, which matters more. "Something else" means another
+        # note, not another spelling of this one: see _same_note.
+        if queried and not _same_note(k1, queried):
             raise ProtocolError(
                 "The service echoed back a different k1 than was queried - the "
                 "note may have been redeemed elsewhere, or the service isn't "

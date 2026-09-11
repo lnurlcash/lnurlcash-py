@@ -55,6 +55,7 @@ from lnurlcash_kit.protocol import (
     merge_request_with_hash,
     mint_invoice_request_with_hash,
     note_info_by_hash_request,
+    note_info_request,
     rotate_request_with_hash,
     split_request_with_hash,
 )
@@ -88,6 +89,19 @@ def query(url: str) -> dict[str, list[str]]:
     return parse_qs(urlparse(url).query)
 
 
+def high_s_twin(ck1: str) -> str:
+    """The same signature with s -> n - s and the recovery id flipped.
+
+    Just as valid, and it recovers to the same key. A conforming signer never
+    makes it, but anyone holding a ck1 can, which makes it the simplest
+    second spelling of one note.
+    """
+    signature = decode_ck1(ck1)
+    s = int.from_bytes(signature[32:64], "big")
+    flipped = (_CURVE_N - s).to_bytes(32, "big")
+    return encode_ck1(signature[:32] + flipped + bytes([signature[64] ^ 1]))
+
+
 # ---- a note's id, either kind ----
 
 
@@ -113,17 +127,11 @@ def test_anything_else_has_no_id(notes, cert):
 
 
 def test_one_note_has_many_ck1_strings_so_notes_compare_by_id(notes):
-    # The high-S twin of an ECDSA signature is just as valid and recovers to
-    # the same key under the flipped recovery id. A conforming signer never
-    # makes it, but anyone holding a ck1 can, so a wallet deduplicating notes
-    # by k1 string would count this one twice.
+    # a wallet deduplicating notes by k1 string would count this one twice
     a = notes[0]
-    signature = decode_ck1(a["ck1"])
-    s = int.from_bytes(signature[32:64], "big")
-    twin = signature[:32] + (_CURVE_N - s).to_bytes(32, "big") + bytes([signature[64] ^ 1])
-    twin_ck1 = encode_ck1(twin)
-    assert twin_ck1 != a["ck1"]
-    assert note_id_of(twin_ck1) == note_id_of(a["ck1"]) == a["notePubkey"]
+    twin = high_s_twin(a["ck1"])
+    assert twin != a["ck1"]
+    assert note_id_of(twin) == note_id_of(a["ck1"]) == a["notePubkey"]
 
 
 def test_the_signed_message_is_over_the_key_for_a_ck1(notes):
@@ -144,6 +152,36 @@ def test_a_note_url_may_carry_a_ck1_but_not_a_cp1(notes, cert):
     assert resolve_note_input(url) == url
     # a cp1 is the note's public key: a URL carrying one spends nothing
     assert resolve_note_input(f"https://mint.example/w?k1={a['cp1']}&amount=1000") is None
+
+
+def _echoing(part2: dict, k1: str) -> dict:
+    """An informational GET's answer, echoing ``k1``."""
+    return {
+        "tag": "withdrawRequest",
+        "callback": CB,
+        "k1": k1,
+        "maxWithdrawable": 21000,
+        "mintPubkey": part2["mint"]["mintPubkey"],
+    }
+
+
+def test_a_mint_echoing_another_spelling_of_the_same_note_is_believed(part2, notes):
+    # Asked with a's ck1, the mint echoes a's high-S twin. That names the same
+    # note, and refusing it would report a live note as redeemed elsewhere.
+    a = notes[0]
+    twin = high_s_twin(a["ck1"])
+    request = note_info_request(f"https://mint.example/w?k1={a['ck1']}&amount=21000")
+    info = request.parse(_echoing(part2, twin))
+    assert note_id_of(info.k1) == a["notePubkey"]
+    assert info.max_withdrawable == 21000
+
+
+def test_a_mint_echoing_a_different_notes_ck1_is_still_refused(part2, notes):
+    # the check exists for exactly this: a different note, however well formed
+    a, b = notes[0], notes[1]
+    request = note_info_request(f"https://mint.example/w?k1={a['ck1']}&amount=21000")
+    with pytest.raises(ProtocolError, match="different k1"):
+        request.parse(_echoing(part2, b["ck1"]))
 
 
 def test_a_part2_note_is_looked_up_by_p_and_a_hash_by_h(notes):

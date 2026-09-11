@@ -30,6 +30,10 @@ snake_case.
 - `note_id_of(k1)`, the id a mint files either kind of note under, and
   `note_lookup_of(k1)`, what to look it up by without disclosing it. One note
   has many valid `ck1` strings, so notes compare by id.
+- `note_info_request` compares an echoed `k1` by the note it names, as the Go
+  kit does. A SERVICE echoing another valid `ck1` for the same note, such as
+  its high-S twin, is not mistaken for one that swapped the note; a different
+  note is still refused.
 - The wire takes both kinds. A `ck1` goes anywhere a `k1` does, and
   `resolve_note_input` accepts a note URL carrying one. A `cp1` output goes as
   `p1`/`p2` from the `*_with_hash` calls while a hash keeps `h`/`h2`;
