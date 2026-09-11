@@ -323,9 +323,9 @@ def _same_note(a: str, b: str) -> bool:
     A Part 1 secret has one spelling, but a Part 2 note has as many valid ck1s
     as a signer has nonces - and anyone can flip a signature to its high-S
     twin - so a SERVICE echoing a different ck1 that recovers to the same key
-    has named the same note, not a different one. Same rule as the Go kit's
-    ParseNoteInfo. Anything that is not a note at all still has to match as
-    text, as it always did.
+    has named the same note, not a different one. Every LNURLcash kit compares
+    the echo this way. Anything that is not a note at all still has to match
+    as text, as it always did.
     """
     if a.strip().lower() == b.strip().lower():
         return True
