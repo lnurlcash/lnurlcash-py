@@ -8,9 +8,11 @@ from __future__ import annotations
 import secrets as _secrets
 import time
 
+import httpx
 import pytest
 
 from lnurlcash_kit import (
+    DEFAULT_POLICY,
     AmbiguousMint,
     AmbiguousMutation,
     LnurlcashClient,
@@ -28,7 +30,11 @@ from lnurlcash_kit import (
     new_secrets_of,
     verify_note_signature,
 )
-from lnurlcash_kit.protocol import mint_address_request
+from lnurlcash_kit.protocol import (
+    mint_address_request,
+    note_info_by_hash_request,
+    note_info_request,
+)
 
 
 def secret() -> str:
@@ -97,6 +103,81 @@ def test_unknown_and_spent_are_different_answers(mint, client):
         client.fetch_note_info(m.note_url(known))
 
 
+# The mintPubkey check. Parsed straight from a body: the mock mint always
+# publishes a key, and what needs grading is which policy refuses a mint that
+# does not, and which admits it.
+
+_NOTE_K1 = "aa" * 32
+_MINT_PUBKEY = "03" + "4f" * 32
+
+
+def _withdraw_request(**extra):
+    return {
+        "tag": "withdrawRequest",
+        "callback": "https://mint.example/w/cb",
+        "k1": _NOTE_K1,
+        "maxWithdrawable": 21000,
+        **extra,
+    }
+
+
+def _parse_note_info(body, policy=None):
+    url = f"https://mint.example/w?k1={_NOTE_K1}"
+    if policy is None:
+        return note_info_request(url).parse(body)
+    return note_info_request(url, policy).parse(body)
+
+
+def _parse_note_info_by_hash(body, policy=None):
+    h = hash_k1(_NOTE_K1)
+    if policy is None:
+        return note_info_by_hash_request("https://mint.example/w", h).parse(body)
+    return note_info_by_hash_request("https://mint.example/w", h, policy).parse(body)
+
+
+@pytest.mark.parametrize("parse", [_parse_note_info, _parse_note_info_by_hash])
+def test_a_mint_publishing_no_valid_mint_pubkey_is_refused_by_default(parse):
+    assert parse(_withdraw_request(mintPubkey=_MINT_PUBKEY)).mint_pubkey == _MINT_PUBKEY
+    for body in (_withdraw_request(), _withdraw_request(mintPubkey="4f" * 32)):
+        with pytest.raises(ProtocolError, match="mintPubkey"):
+            parse(body)
+        # require_signatures no longer carries this check: turning it off,
+        # which is now the default anyway, admits nothing extra
+        with pytest.raises(ProtocolError, match="mintPubkey"):
+            parse(body, Policy(require_signatures=False))
+
+
+@pytest.mark.parametrize("parse", [_parse_note_info, _parse_note_info_by_hash])
+def test_a_part1_only_mint_is_admitted_with_require_mint_pubkey_off(parse):
+    info = parse(_withdraw_request(), Policy(require_mint_pubkey=False))
+    assert info.mint_pubkey is None
+    assert info.max_withdrawable == 21000
+    # and it is its own switch: demanding the Part 1 signature does not put
+    # the key back
+    both = Policy(require_signatures=True, require_mint_pubkey=False)
+    assert parse(_withdraw_request(), both).mint_pubkey is None
+
+
+def test_the_client_applies_require_mint_pubkey():
+    def answer(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_withdraw_request())
+
+    url = f"https://mint.example/w?k1={_NOTE_K1}"
+    with httpx.Client(transport=httpx.MockTransport(answer)) as http:
+        with pytest.raises(ProtocolError, match="mintPubkey"):
+            LnurlcashClient(client=http).fetch_note_info(url)
+        lenient = LnurlcashClient(client=http, policy=Policy(require_mint_pubkey=False))
+        assert lenient.fetch_note_info(url).mint_pubkey is None
+
+
+def test_the_default_policy_is_the_part2_one():
+    # a cs1 on every cp1 output is not a field: nothing turns it off
+    assert DEFAULT_POLICY == Policy()
+    assert DEFAULT_POLICY.require_signatures is False
+    assert DEFAULT_POLICY.require_mint_pubkey is True
+    assert LnurlcashClient().policy == DEFAULT_POLICY
+
+
 # ---- rotate ----
 
 
@@ -114,6 +195,8 @@ def test_rotate_burns_the_old_secret_and_mints_one_the_service_never_saw(mint, c
 
 
 def test_rotate_signature_verifies_offline(mint, client):
+    # A mint still issuing the old Part 1 signature over a plain note is fine:
+    # the default neither demands it nor drops it.
     m = mint()
     k1 = secret()
     m.credit(k1, 21000)
@@ -134,16 +217,46 @@ def test_accepts_the_other_recovery_id_layout(mint, client):
     assert verify_note_signature(rotated.k1, 21000, rotated.signature, m.pubkey)
 
 
-def test_an_unsigned_rotate_is_refused_without_losing_the_note(mint, client):
-    """Offline verification stopped being optional, so a SERVICE issuing no
-    signatures is non-compliant rather than merely basic.
+def test_an_unsigned_rotate_to_a_plain_note_is_the_spec(mint, client):
+    """LUD-25 Part 2 certifies cp1 notes only: a hash has nothing to attest to
+    without disclosing the secret. So a mint answering a plain rotate with a
+    bare OK is following the spec, and the note comes back with no signature,
+    which is exactly what it is."""
+    m = mint(signatures=False)
+    k1 = secret()
+    m.credit(k1, 21000)
+    info = client.fetch_note_info(m.note_url(k1))
+    rotated = client.rotate_note(info.callback, k1)
+    assert rotated.signature is None
+    assert m.note_state(k1) == "burned"
+    assert m.note_state(rotated.k1) == "outstanding"
+
+
+def test_an_unsigned_split_and_merge_to_plain_notes_are_the_spec(mint, client):
+    m = mint(signatures=False)
+    k1 = secret()
+    m.credit(k1, 21000)
+    split = client.split_note(f"{m.url}/w/cb", [k1], 5000)
+    assert split.signature is None and split.change_signature is None
+    assert m.note_state(split.k1) == "outstanding"
+    assert m.note_state(split.change) == "outstanding"
+
+    merged = client.merge_notes(f"{m.url}/w/cb", [split.k1, split.change])
+    assert merged.signature is None
+    assert client.fetch_note_info(m.note_url(merged.k1)).max_withdrawable == 21000
+
+
+def test_require_signatures_still_refuses_an_unsigned_plain_note(mint):
+    """A caller who still wants the old Part 1 signature over the hash can ask
+    for it.
 
     The refusal has to be the loud kind - but the rotate LANDED, and the fresh
     secret is the only key to the note it minted, so the exception carries it
     out. Raising without it would be the library destroying real money to make
-    a point about conformance.
+    a point about a signature.
     """
     m = mint(signatures=False)
+    client = LnurlcashClient(timeout=10.0, policy=Policy(require_signatures=True))
     k1 = secret()
     m.credit(k1, 21000)
     info = client.fetch_note_info(m.note_url(k1))
@@ -155,19 +268,12 @@ def test_an_unsigned_rotate_is_refused_without_losing_the_note(mint, client):
     # nothing but the secret the exception handed back
     assert m.note_state(kept[0]) == "outstanding"
 
-
-def test_an_unsigned_service_still_works_when_the_caller_opts_out(mint):
-    """The same mint, for a caller who has decided to deal with it anyway."""
-    m = mint(signatures=False)
-    client = LnurlcashClient(
-        timeout=10.0, policy=Policy(require_signatures=False)
-    )
-    k1 = secret()
-    m.credit(k1, 21000)
-    info = client.fetch_note_info(m.note_url(k1))
-    rotated = client.rotate_note(info.callback, k1)
-    assert rotated.signature is None
-    assert m.note_state(rotated.k1) == "outstanding"
+    # and a split hands back both, in output order, since both landed
+    with pytest.raises(UnverifiableNote) as raised:
+        client.split_note(info.callback, kept, 5000)
+    split_off, change = new_secrets_of(raised.value)
+    assert client.fetch_note_info(m.note_url(split_off)).max_withdrawable == 5000
+    assert client.fetch_note_info(m.note_url(change)).max_withdrawable == 16000
 
 
 def test_ignores_a_secret_the_service_tries_to_hand_back(mint, client):

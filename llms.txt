@@ -17,7 +17,9 @@ Reference mint: https://github.com/dni/lnurl-mint
 
 from lnurlcash_kit import LnurlcashClient, AsyncLnurlcashClient
 
-client = LnurlcashClient(timeout=30.0, offline=False, rng=generate_note_secret)
+client = LnurlcashClient(timeout=30.0, offline=False, rng=generate_note_secret,
+                         policy=Policy(), mutation_retries=1)
+Policy(require_signatures=False, require_mint_pubkey=True) is the default.
 
 client.fetch_note_info(url) -> WithdrawRequestInfo(callback, k1, max_withdrawable, mint_pubkey)
 client.rotate_note(callback, k1) -> RotateResult(k1, signature)
@@ -50,11 +52,16 @@ returns Request(url, parse, new_secrets) and performs no I/O.
    may already have minted.
 4. RequestRefused means nothing was sent - safe to treat as a no-op.
 5. A melt's OK means IN FLIGHT, not spent. NotePending means retry, not spent.
-5b. Offline verification is MANDATORY. A conforming service publishes
-   mintPubkey on every withdrawRequest and returns sig (and sig2 on a split)
-   from every rotate/split/merge. This library refuses a service that does not;
-   UnverifiableNote means the mutation LANDED unsigned, so keep its secrets.
-   Opt out with policy=Policy(require_signatures=False).
+5b. A cp1 note is owed its certificate; a plain note is UNSIGNED. LUD-25 Part
+   2 certifies cp1 outputs only: a rotate/split/merge to a cp1 output (p1, or
+   p2 for a split's change) MUST return its cs1 in sig (sig2 for the change),
+   and a missing one raises UnverifiableNote WHATEVER the policy says. A hash
+   output comes back with signature None by design; that is not an error.
+   UnverifiableNote means the mutation LANDED, so keep its secrets (empty
+   after a *_with_hash call: the caller already holds that key).
+   Policy(require_signatures=True) also demands the old Part 1 signature over
+   a hash. Policy(require_mint_pubkey=True), the default, refuses a
+   withdrawRequest with no valid mintPubkey; set False for a Part 1-only mint.
 5c. A retried rotate/split/merge MUST be answered by the service as a replay of
    the original success, so a client re-sends one whose answer was lost
    (mutation_retries, default 1) and usually completes it. NEVER a melt. The
@@ -70,8 +77,10 @@ returns Request(url, parse, new_secrets) and performs no I/O.
 RequestRefused     nothing sent, note untouched
 ServiceRejected    processed and refused (definitive)
   NotePending      a melt is in flight on this k1 - retry
-UnverifiableNote   the mutation LANDED and came back unsigned. The note is
-                   REAL; carries .new_secrets - persist them
+UnverifiableNote   the mutation LANDED without a signature it owed: a cp1
+                   output's cs1, or a hash output's Part 1 signature under
+                   require_signatures=True. The note is REAL; carries
+                   .new_secrets - persist them
 new_secrets_of(err) the secrets carried by ANY exception that could describe a
                    mutation the service applied: ambiguous, unverifiable, spent
                    or unknown

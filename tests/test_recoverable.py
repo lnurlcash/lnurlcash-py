@@ -19,8 +19,10 @@ from coincurve import PrivateKey
 from conftest import load_vectors
 from lnurlcash_kit import (
     LnurlcashClient,
+    Policy,
     ProtocolError,
     RequestRefused,
+    UnverifiableNote,
     build_note_info_url_by_hash,
     cash_node_from_hex,
     decode_ck1,
@@ -41,6 +43,7 @@ from lnurlcash_kit import (
     is_cp1,
     is_cs1,
     is_cx1,
+    new_secrets_of,
     note_id_of,
     note_lookup_of,
     note_signature_message,
@@ -249,6 +252,95 @@ def test_one_merge_takes_a_part1_secret_and_a_part2_note(notes):
     a, c = notes[0], notes[2]
     request = merge_request_with_hash(CB, [K1, a["ck1"]], c["cp1"])
     assert query(request.url) == {"k1": [K1, a["ck1"]], "p1": [c["cp1"]]}
+
+
+# What each output is owed. A cp1 note is owed its cs1 whatever the policy
+# says, because without one it cannot be checked offline, which is the whole
+# reason to hold one. A hash output is a plain note and is owed nothing unless
+# the caller asks for the old Part 1 signature.
+
+_EVERY_POLICY = [
+    None,
+    Policy(require_signatures=False),
+    Policy(require_signatures=True),
+    Policy(require_signatures=False, require_mint_pubkey=False),
+]
+_PART1_SIG = "ab" * 65
+
+
+def _with_policy(build, *args, policy):
+    return build(*args) if policy is None else build(*args, policy)
+
+
+@pytest.mark.parametrize("policy", _EVERY_POLICY, ids=repr)
+def test_an_uncertified_cp1_output_is_unverifiable_whatever_the_policy(notes, policy):
+    a, b = notes[0], notes[1]
+    for request in (
+        _with_policy(rotate_request_with_hash, CB, a["ck1"], b["cp1"], policy=policy),
+        # the same key in upper case is still sent as p1, so still owed a cs1
+        _with_policy(
+            rotate_request_with_hash, CB, a["ck1"], b["cp1"].upper(), policy=policy
+        ),
+        _with_policy(merge_request_with_hash, CB, [K1, a["ck1"]], b["cp1"], policy=policy),
+        _with_policy(
+            split_request_with_hash, CB, [a["ck1"]], 5000, b["cp1"], hash_k1(K1),
+            policy=policy,
+        ),
+    ):
+        for body in ({"status": "OK"}, {"status": "OK", "sig": ""}):
+            with pytest.raises(UnverifiableNote):
+                request.parse(body)
+
+
+@pytest.mark.parametrize("policy", _EVERY_POLICY, ids=repr)
+def test_a_cp1_change_without_sig2_is_unverifiable_whatever_the_policy(
+    notes, cert, policy
+):
+    a, b, c = notes[0], notes[1], notes[2]
+    # the change is no lesser note than the first output
+    behind_a_hash = _with_policy(
+        split_request_with_hash, CB, [a["ck1"]], 5000, hash_k1(K1), c["cp1"],
+        policy=policy,
+    )
+    with pytest.raises(UnverifiableNote):
+        behind_a_hash.parse({"status": "OK", "sig": _PART1_SIG})
+    both_keys = _with_policy(
+        split_request_with_hash, CB, [a["ck1"]], 5000, b["cp1"], c["cp1"],
+        policy=policy,
+    )
+    with pytest.raises(UnverifiableNote):
+        both_keys.parse({"status": "OK", "sig": cert["cs1"]})
+    certified = both_keys.parse({"status": "OK", "sig": cert["cs1"], "sig2": cert["cs1"]})
+    assert certified.signature == certified.change_signature == cert["cs1"]
+
+
+def test_a_hash_change_beside_a_certified_cp1_is_a_plain_note(notes, cert):
+    a, b = notes[0], notes[1]
+    request = split_request_with_hash(CB, [a["ck1"]], 5000, b["cp1"], hash_k1(K1))
+    result = request.parse({"status": "OK", "sig": cert["cs1"]})
+    assert result.signature == cert["cs1"]
+    assert result.change_signature is None
+    # unless the caller asks for the Part 1 signature over the hash
+    strict = split_request_with_hash(
+        CB, [a["ck1"]], 5000, b["cp1"], hash_k1(K1), Policy(require_signatures=True)
+    )
+    with pytest.raises(UnverifiableNote):
+        strict.parse({"status": "OK", "sig": cert["cs1"]})
+
+
+def test_an_uncertified_cp1_hands_back_nothing_it_never_held(notes):
+    """The caller named that output and holds its key; this library never saw
+    it, so there is nothing for the exception to carry. It is still raised,
+    through the client, as the landed mutation it is."""
+    a, b = notes[0], notes[1]
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"status": "OK"})
+
+    with httpx.Client(transport=httpx.MockTransport(answer)) as http:
+        with pytest.raises(UnverifiableNote) as raised:
+            LnurlcashClient(client=http).rotate_note_with_hash(CB, a["ck1"], b["cp1"])
+    assert new_secrets_of(raised.value) == []
 
 
 def test_a_ck1_melts_like_any_k1(notes):

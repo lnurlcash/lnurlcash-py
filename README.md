@@ -39,14 +39,17 @@ print(info.max_withdrawable, "msat")
 
 fresh = client.rotate_note(info.callback, info.k1)   # that GET exposed the secret
 
-# check it, without asking anyone. Both are guaranteed: LUD-25 requires the
-# mint to publish mint_pubkey and to sign what it mints, and this library
-# refuses a mint that does neither.
-verify_note_signature(fresh.k1, info.max_withdrawable, fresh.signature, info.mint_pubkey)
+# A plain note comes back unsigned: LUD-25 Part 2 certifies cp1 notes only,
+# and a hash has nothing to attest to without disclosing the secret. To hold
+# something a recipient can check offline, rotate into a cp1 key (see Part 2
+# below) and verify its cs1 against info.mint_pubkey.
+if fresh.signature is not None:            # a mint still signing Part 1 notes
+    verify_note_signature(fresh.k1, info.max_withdrawable, fresh.signature, info.mint_pubkey)
 ```
 
 `AsyncLnurlcashClient` has the identical surface with `await`. Both accept
-`timeout`, `offline`, `rng`, and an existing `httpx` client:
+`timeout`, `offline`, `rng`, `policy`, `mutation_retries`, and an existing
+`httpx` client:
 
 ```python
 async with httpx.AsyncClient() as http:
@@ -111,9 +114,9 @@ and [Go](https://github.com/TheCryptoDonkey/lnurlcash-go) siblings during
 development, by two different mechanisms.
 
 LUD-25 closed it. A service MUST answer a byte-identical rotate, split or merge
-with the success it already returned, signature and all. So this library
-re-sends one whose answer was lost, and an unstoppable transport retry is now
-simply invisible:
+with the success it already returned, signatures and all where there were any.
+So this library re-sends one whose answer was lost, and an unstoppable
+transport retry is now simply invisible:
 
 ```python
 # the connection dropped after the mint applied this. It completes anyway.
@@ -131,14 +134,27 @@ set, `h`, `h2` and `amount`.
 deliberate retry it counts is a different thing from an invisible one it does
 not. If you pass your own client, do not configure a retrying transport.
 
-**3b. Offline verification is mandatory.** A service MUST publish `mintPubkey`
-and MUST sign every note a rotate, split or merge mints. `fetch_note_info`
-raises `ProtocolError` for a `withdrawRequest` publishing no valid one, and a
-mutation the service confirms but does not sign raises `UnverifiableNote` —
-which **carries the fresh secrets**, because the mutation landed and the note
-it minted is real. Read them with `new_secrets_of` and persist them before
-anything else. Pass `policy=Policy(require_signatures=False)` to deal with a
-mint that predates the requirement.
+**3b. A `cp1` note is owed its certificate; a plain note is unsigned.** LUD-25
+Part 2 certifies `cp1` notes only. A rotate, split or merge to a `cp1` output
+that the service confirms without its `cs1` (in `sig`, or `sig2` for a split's
+change) raises `UnverifiableNote`, whatever the policy says. A mutation to a
+plain hash output has nothing to attest to without disclosing the secret, so
+it comes back with `signature` set to `None`, and that is the spec, not a fault.
+
+`UnverifiableNote` **carries the fresh secrets** the library generated,
+because the mutation landed and the note it minted is real. Read them with
+`new_secrets_of` and persist them before anything else. It is empty after a
+`*_with_hash` call, whose caller named the output and already holds its key.
+
+Two `Policy` fields tune the rest. `require_signatures=True` demands the old
+Part 1 signature over a hash output too, as mints issued before the Part 2
+rewrite. `require_mint_pubkey` (default `True`) makes `fetch_note_info` raise
+`ProtocolError` for a `withdrawRequest` publishing no valid `mintPubkey`; set
+it `False` for a Part 1-only mint that publishes none.
+
+```python
+client = LnurlcashClient(policy=Policy(require_signatures=True))  # the old default
+```
 
 **4. A melt's `OK` means "in flight", not "spent".** The service pays
 asynchronously and only burns the note once the payment settles, restoring it
@@ -227,7 +243,7 @@ pk = derive_note_pubkey(branch.pubkey_x_only, branch.chain_code, i)  # what a wa
 sk = derive_note_secret_key(node.private_key, node.chain_code, i)
 ck1 = encode_ck1(sign_note_ownership(sk))                            # the bearer secret
 
-client.rotate_note_with_hash(callback, ck1, encode_cp1(next_pk))     # sent as p1
+client.rotate_note_with_hash(callback, ck1, encode_cp1(next_pk))     # sent as p1; its cs1 is owed
 verify_note_signature(ck1, amount_msat, cs1, mint_pubkey)            # offline
 ```
 
@@ -271,8 +287,8 @@ string in them.
 | `NoteUnknown` | the service does not recognise it. |
 | `AmbiguousMint` | outcome **unknown**. Assume nothing. |
 | `AmbiguousMutation` | as above, carrying `.new_secrets`. |
-| `UnverifiableNote` | the mutation **landed** and came back unsigned. The note is real; carries `.new_secrets`. |
-| `ProtocolError` | a non-mutating response did not match the spec, including a `withdrawRequest` with no `mintPubkey`. |
+| `UnverifiableNote` | the mutation **landed** without a signature it owed: a `cp1` output's `cs1`, or a hash output's Part 1 signature under `require_signatures=True`. The note is real; carries `.new_secrets`. |
+| `ProtocolError` | a non-mutating response did not match the spec, including a `withdrawRequest` with no `mintPubkey` (unless `require_mint_pubkey=False`). |
 
 Branch on the class, never on the message.
 

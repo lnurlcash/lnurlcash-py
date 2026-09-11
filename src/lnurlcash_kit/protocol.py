@@ -58,20 +58,33 @@ class Request:
 class Policy:
     """What this library insists a SERVICE does, rather than merely hopes.
 
-    LUD-25 makes offline verification mandatory: a SERVICE MUST publish
-    ``mintPubkey`` and MUST sign every note a rotate, split or merge mints. A
-    wallet that quietly accepted unsigned notes would be handing its holder
-    something nobody downstream can check, which is the exact gap offline
-    verification exists to close - so the default insists.
+    LUD-25 Part 2 certifies ``cp1`` notes only. A rotate, split or merge to a
+    ``cp1`` output MUST come back with its ``cs1`` certificate in ``sig``
+    (``sig2`` for a split's change), and this library always insists on that:
+    nothing here turns it off, because a ``cp1`` note nobody can check offline
+    is missing the one thing it is for. A plain hash output has nothing a
+    SERVICE can attest to without disclosing the secret, so it comes back
+    unsigned by design, with ``signature`` None.
 
-    Set ``require_signatures`` false only to talk to a SERVICE that predates
-    the requirement, and only knowing the cost.
+    ``require_signatures`` also demands the old Part 1 signature over a hash
+    output, as every mint issued before the Part 2 rewrite. Off by default: a
+    SERVICE following the current draft answers a plain rotate with a bare
+    ``{"status":"OK"}``, and refusing that would be refusing the spec.
+
+    ``require_mint_pubkey`` refuses a ``withdrawRequest`` that publishes no
+    valid ``mintPubkey``, the key a ``cp1`` note's certificate verifies
+    against. On by default. Set it false only for a Part 1-only SERVICE that
+    publishes none, knowing that nothing it issues can then be checked
+    offline.
     """
 
-    require_signatures: bool = True
+    require_signatures: bool = False
+    require_mint_pubkey: bool = True
 
 
-#: The strict policy, used wherever a caller states none.
+#: What a caller gets without stating a policy: a ``cs1`` on every ``cp1``
+#: output, a ``mintPubkey`` on every ``withdrawRequest``, and a plain note
+#: taken as the unsigned thing it is.
 DEFAULT_POLICY = Policy()
 
 
@@ -100,9 +113,9 @@ class WithdrawRequestInfo:
     max_withdrawable: int
     min_withdrawable: int = 0
     default_description: str | None = None
-    #: LUD-25 makes offline verification mandatory, so a conforming SERVICE
-    #: always publishes the key its notes verify against here. Only ever None
-    #: when the caller passed a Policy with ``require_signatures`` false.
+    #: The key a ``cp1`` note's certificate verifies against, and a legacy
+    #: Part 1 signature too. Only ever None when the caller passed a Policy
+    #: with ``require_mint_pubkey`` false.
     mint_pubkey: str | None = None
     #: the response's ``sig``: for a Part 2 note, the SERVICE's ready-made
     #: cs1 certificate for its current amount, so a holder need not force a
@@ -383,7 +396,7 @@ def note_info_request(url: str, policy: Policy = DEFAULT_POLICY) -> Request:
         # response IS a withdrawRequest, it just describes a note nobody can
         # check offline. Saying "not a withdrawRequest" would send a caller
         # after the wrong fault.
-        if policy.require_signatures and not is_compressed_pubkey(mint_pubkey):
+        if policy.require_mint_pubkey and not is_compressed_pubkey(mint_pubkey):
             raise ProtocolError(
                 "This service publishes no mintPubkey, so its notes cannot be "
                 "verified offline (LUD-25 requires one)."
@@ -427,9 +440,10 @@ def note_info_by_hash_request(
 
     Differs from :func:`note_info_request` in exactly two places, both because
     there was no secret in the request: ``k1`` is not required in the response,
-    and there is no echo to check. The shape and the mandatory ``mintPubkey``
-    are enforced identically - a note nobody can verify offline is no more
-    acceptable when it was looked up privately.
+    and there is no echo to check. The shape, and ``mintPubkey`` under the
+    same ``require_mint_pubkey``, are enforced identically - a mint nobody can
+    verify against is no more acceptable when its note was looked up
+    privately.
     """
     from .note import build_note_info_url_by_hash
 
@@ -457,7 +471,7 @@ def note_info_by_hash_request(
         ):
             raise ProtocolError("Not a withdrawRequest (unexpected response).")
         mint_pubkey = body.get("mintPubkey")
-        if policy.require_signatures and not is_compressed_pubkey(mint_pubkey):
+        if policy.require_mint_pubkey and not is_compressed_pubkey(mint_pubkey):
             raise ProtocolError(
                 "This service publishes no mintPubkey, so its notes cannot be "
                 "verified offline (LUD-25 requires one)."
@@ -537,19 +551,45 @@ def _parse_success(body: Any) -> dict:
     return body
 
 
+def _names_cp1(output: str) -> bool:
+    """Whether an output goes on the wire as a Part 2 key rather than a hash.
+
+    One predicate for both halves of the rule, so what is sent as ``p1`` or
+    ``p2`` and what is owed a certificate cannot drift apart.
+    """
+    return is_cp1(output.strip().lower())
+
+
 def _require_signature(
-    value: Any, policy: Policy, what: str
+    value: Any, policy: Policy, what: str, output: str
 ) -> str | None:
-    """Every mutation the replay rule covers owes a signature over each note
-    it mints, and LUD-25 no longer lets a SERVICE opt out.
+    """What a mutation owes for each note it mints, by the kind of note.
+
+    ``output`` is the ``h``/``p1`` (or ``h2``/``p2``) the mutation named. A
+    ``cp1`` output is owed its ``cs1`` certificate: LUD-25 Part 2 requires one,
+    and it is the whole reason to hold a ``cp1`` note, so no policy waives it.
+    A plain hash output has nothing a SERVICE can attest to without disclosing
+    the secret, so it is unsigned by design, and is only refused for coming
+    back unsigned when ``require_signatures`` asks for the old Part 1
+    signature. A signature that is present is passed on as sent either way,
+    never checked here: :func:`~lnurlcash_kit.signature.verify_note_signature`
+    is the check.
 
     The mutation has already landed by the time this is called - ``status`` was
     OK - so the exception has to carry the caller's secrets out with it, or
     enforcing the spec becomes the thing that loses the money. ``new_secrets``
-    is filled in by the client, which is what holds them.
+    is filled in by the client, which is what holds them. It stays empty after
+    a ``*_with_hash`` call, whose caller supplied the output and never gave
+    this library its secret.
     """
     if isinstance(value, str) and value:
         return value
+    if _names_cp1(output):
+        raise UnverifiableNote(
+            f"The service confirmed the {what} to a cp1 output but returned no "
+            "cs1 certificate, which LUD-25 Part 2 requires, so the note it just "
+            "minted cannot be verified offline. The note exists - keep the key."
+        )
     if not policy.require_signatures:
         return None
     raise UnverifiableNote(
@@ -604,7 +644,7 @@ def _output_param(value: str, which: int) -> tuple[str, str]:
     version flag, which is lnurl-wallet's rule. The value itself goes out as
     given, so a retry is byte-identical to the request it repeats.
     """
-    if is_cp1(value.strip().lower()):
+    if _names_cp1(value):
         return (f"p{which}", value)
     return ("h" if which == 1 else "h2", value)
 
@@ -612,12 +652,20 @@ def _output_param(value: str, which: int) -> tuple[str, str]:
 def rotate_request_with_hash(
     callback: str, k1: str, h: str, policy: Policy = DEFAULT_POLICY
 ) -> Request:
+    """Rotate ``k1`` into an output the caller names: a hash, or a ``cp1``.
+
+    A ``cp1`` output that comes back without its ``cs1`` raises
+    :class:`~lnurlcash_kit.errors.UnverifiableNote` whatever the policy says.
+    A hash output that comes back unsigned is a plain note and returns
+    ``signature`` None, unless the policy's ``require_signatures`` asks for
+    the old Part 1 signature over it.
+    """
     url = _callback(callback, [("k1", k1), _output_param(h, 1)])
 
     def parse(body: Any) -> MutationResult:
         ok = _parse_success(body)
         return MutationResult(
-            signature=_require_signature(ok.get("sig"), policy, "rotate")
+            signature=_require_signature(ok.get("sig"), policy, "rotate", h)
         )
 
     return Request(url=url, parse=parse, replayable=True)
@@ -631,6 +679,10 @@ def split_request_with_hash(
     h2: str,
     policy: Policy = DEFAULT_POLICY,
 ) -> Request:
+    """Split into ``amount_msat`` at ``h`` and the change at ``h2``, each a
+    hash or a ``cp1``. Each output is owed what its kind is owed, exactly as
+    in :func:`rotate_request_with_hash`: a ``cp1`` change without ``sig2``
+    raises, a hash change without one is a plain note."""
     url = _callback(
         callback,
         [("k1", k1) for k1 in k1s]
@@ -639,12 +691,13 @@ def split_request_with_hash(
 
     def parse(body: Any) -> MutationResult:
         ok = _parse_success(body)
-        # Both outputs of a split are notes, and both need a signature.
+        # Both outputs of a split are notes, and each is owed what its kind
+        # is owed: a cp1 change is no lesser note than a cp1 first output.
         # Checked in output order so the message names the one missing.
         return MutationResult(
-            signature=_require_signature(ok.get("sig"), policy, "split"),
+            signature=_require_signature(ok.get("sig"), policy, "split", h),
             change_signature=_require_signature(
-                ok.get("sig2"), policy, "split's change"
+                ok.get("sig2"), policy, "split's change", h2
             ),
         )
 
@@ -659,7 +712,7 @@ def merge_request_with_hash(
     def parse(body: Any) -> MutationResult:
         ok = _parse_success(body)
         return MutationResult(
-            signature=_require_signature(ok.get("sig"), policy, "merge")
+            signature=_require_signature(ok.get("sig"), policy, "merge", h)
         )
 
     return Request(url=url, parse=parse, replayable=True)
@@ -671,6 +724,10 @@ def merge_request_with_hash(
 # its hash. The SERVICE never sees, generates or persists it, which is what
 # closes the prior-holder exposure a SERVICE-generated replacement would
 # otherwise reopen on every single rotate.
+#
+# Every output here is a plain hash note, so against a SERVICE following Part
+# 2 its signature comes back None. A note someone else can verify offline is
+# a cp1 note: name one through the *_with_hash calls.
 
 
 def rotate_request(

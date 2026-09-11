@@ -8,9 +8,10 @@ What each class means for the money involved:
     AmbiguousMint     the outcome is unknown. The request MAY have been
                       processed. Nothing may be assumed either way.
     ProtocolError     a non-mutating response did not match the spec.
-    UnverifiableNote  a MUTATION landed and the SERVICE returned no signature
-                      over it. The note exists; it just cannot be verified
-                      offline.
+    UnverifiableNote  a MUTATION landed and the SERVICE withheld a signature
+                      it owed: a cp1 output's certificate, or a hash output's
+                      Part 1 signature when the policy asks for one. The note
+                      exists; it just cannot be verified offline.
 
 Treating an ambiguous failure as a definitive one is how wallets lose money:
 a rotate that times out after the SERVICE burned the input has already
@@ -91,20 +92,26 @@ class AmbiguousMint(LnurlcashError):
 
 class UnverifiableNote(LnurlcashError):
     """The SERVICE confirmed a rotate, split or merge with {"status":"OK"}
-    but returned no signature over the hash it was given.
+    but withheld a signature the note it minted was owed.
 
-    LUD-25 makes offline verification mandatory, so this is a non-compliant
-    SERVICE - but the mutation LANDED. The note exists, at the hash the caller
-    disclosed, and the WALLET-generated secret behind it is the only key to
-    that value anywhere.
+    Raised for a ``cp1`` output that came back without its ``cs1``
+    certificate, which LUD-25 Part 2 requires whatever the policy says - a
+    non-compliant SERVICE. And for a hash output that came back unsigned when
+    the policy's ``require_signatures`` asked for the old Part 1 signature.
+    Otherwise a hash output coming back unsigned is the spec, and raises
+    nothing.
+
+    Either way the mutation LANDED. The note exists, at the key or hash the
+    caller disclosed, and the secret behind it is the only key to that value
+    anywhere.
 
     So this is an exception about the note's VERIFIABILITY, never about its
     existence, and it carries the secrets for the same reason
     AmbiguousMutation does: raising without them would strand real money to
     make a point about conformance. Persist ``new_secrets``, then decide
     whether to keep dealing with a mint that issues notes nobody can check.
-
-    Only ever raised when the policy requires signatures, which is the default.
+    They are empty after a ``*_with_hash`` call, whose caller supplied the
+    output and already holds its secret.
     """
 
     def __init__(self, message: str, new_secrets: list[str] | None = None) -> None:
