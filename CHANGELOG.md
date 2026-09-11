@@ -5,6 +5,39 @@ carry breaking changes; pin an exact version.
 
 ## 0.1.0 — unreleased
 
+### A plain note is unsigned
+
+LUD-25 Part 2 certifies `cp1` notes only: a plain hash has nothing to attest
+to without disclosing the secret. The reference mint and moneyer now answer a
+rotate, split or merge to a hash output with a bare `{"status":"OK"}`, and
+with the old default this library raised `UnverifiableNote` on every plain
+rotate against them. So it follows the spec, as lnurlcash-kit 0.13.0 does.
+
+- `Policy.require_signatures` now defaults to **False**. A hash output that
+  comes back unsigned is the spec, not a fault: `signature` (and
+  `change_signature`) is `None`, and nothing is raised. Set it true to keep
+  demanding the old Part 1 signature over the hash.
+- A `cp1` output is owed its `cs1` certificate whatever the policy says. A
+  rotate, split or merge naming one (sent as `p1`, or `p2` for a split's
+  change) that comes back without `sig` (or `sig2` for a `cp1` change) raises
+  `UnverifiableNote`. It carries no secrets: only the `*_with_hash` calls can
+  name a `cp1` output, and their caller already holds the key.
+- A signature that is present on a hash output is passed on as before, so a
+  mint still issuing the Part 1 signature is fine where it verifies.
+- New `Policy.require_mint_pubkey`, default True, takes over the
+  `withdrawRequest` `mintPubkey` check that `require_signatures` used to
+  carry, in `note_info_request` and `note_info_by_hash_request` alike. A Part
+  1-only mint that publishes no `mintPubkey` is admitted with it set False.
+- Graded against `lnurlcash-conformance` 0.10.0, which CI now pins. Every
+  `responses.json` case is driven through the client for the first time,
+  picking a `cp1` or a hash output by the case's `output` and `change`
+  fields, and each bare "mutation" case through both rotate and merge.
+
+If you relied on the default to refuse unsigned plain notes, pass
+`Policy(require_signatures=True)`. If you only ever wanted notes a recipient
+can verify offline, hold `cp1` notes: they are the only kind the spec makes
+verifiable.
+
 ### LUD-25 Part 2: notes keyed by a public key
 
 A Part 2 note is keyed by a public key rather than a hash. The holder keeps
@@ -97,18 +130,21 @@ and the adversarial mock mint.
 
 ### Design notes
 
-**Offline verification is mandatory, and this library insists on it.** LUD-25
-stopped treating a note signature as optional: a SERVICE MUST publish
-`mintPubkey` and MUST sign every note a rotate, split or merge mints. So
-`note_info_request` refuses a `withdrawRequest` publishing no `mintPubkey`, or
-one that is not a 33-byte compressed secp256k1 key, and a mutation the SERVICE
-confirms without signing raises the new `UnverifiableNote`.
-`Policy(require_signatures=False)` opts out.
+**A `cp1` note is owed its certificate, and this library insists on it.** For
+a while LUD-25 required a signature over every note a rotate, split or merge
+minted, and this library's default refused an unsigned one. The Part 2
+rewrite narrowed that to `cp1` notes, the only kind a SERVICE can certify
+without seeing the secret, so a mutation to a `cp1` output that comes back
+without its `cs1` raises `UnverifiableNote`, and a plain hash output comes
+back unsigned by design. `note_info_request` refuses a `withdrawRequest`
+publishing no `mintPubkey`, or one that is not a 33-byte compressed secp256k1
+key, unless `Policy(require_mint_pubkey=False)`.
+`Policy(require_signatures=True)` still demands the old signature over a hash.
 
-That exception carries the fresh secrets, and the reason matters: `status` was
-OK, so the mutation LANDED. The note exists at the hash the wallet disclosed
-and that secret is the only key to it, so enforcing the spec must never be the
-thing that strands the money.
+That exception carries whatever fresh secrets the library generated, and the
+reason matters: `status` was OK, so the mutation LANDED. The note exists at the
+key or hash the wallet disclosed and that secret is the only key to it, so
+enforcing the spec must never be the thing that strands the money.
 
 **A spent-or-unknown refusal from a mutation carries its secrets too.** At a
 SERVICE that has not implemented the replay rule below, a retried mutation is

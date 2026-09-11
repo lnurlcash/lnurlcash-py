@@ -65,8 +65,10 @@ class _Base:
         #: RNG or a deterministic test - and see secrets.generate_note_secret
         #: for what a caller takes on by doing so.
         self.rng = rng
-        #: What this client insists a SERVICE does. The default requires the
-        #: offline verification LUD-25 makes mandatory.
+        #: What this client insists a SERVICE does. The default demands a cs1
+        #: on every cp1 output and a mintPubkey on every withdrawRequest, and
+        #: takes a plain hash note unsigned, as LUD-25 Part 2 has it. See
+        #: :class:`~lnurlcash_kit.protocol.Policy`.
         self.policy = policy
         #: How many times to re-send a rotate, split or merge whose outcome the
         #: transport lost. LUD-25 requires a SERVICE to answer a byte-identical

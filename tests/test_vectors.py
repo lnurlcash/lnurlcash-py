@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import unicodedata
 
+import httpx
 import pytest
 from coincurve import PrivateKey, PublicKey
 
@@ -20,8 +21,16 @@ from lnurlcash_kit.protocol import (
 )
 from lnurlcash_kit import (
     NOSTR_CASH_SEED_LABEL,
+    AmbiguousMint,
     Cx1,
+    LnurlcashClient,
+    LnurlcashError,
     MintFee,
+    NotePending,
+    NoteSpent,
+    NoteUnknown,
+    ServiceRejected,
+    UnverifiableNote,
     cash_domain_indices,
     cash_node_from_hex,
     cash_node_to_cx1,
@@ -117,6 +126,111 @@ def test_signature_verification(case):
 def test_signature_digest_derivation(case):
     assert note_signature_message(case["k1"], case["amountMsat"]) == case["message"]
     assert note_signature_digest(case["k1"], case["amountMsat"]).hex() == case["digest"]
+
+
+# ---- response classification ----
+#
+# responses.json: what each answer to a callback means for the money. `op`
+# says which call a case is driven through, and `output` and `change` which
+# kind of note the mutation mints, a hash unless the case says cp1. Driven
+# through the real client over a mock transport, so a dropped connection, a
+# timeout and an unreadable body are graded on the client's own
+# classification rather than a restatement of it. Retries are off so one case
+# is one request - the replay behaviour has its own tests.
+
+_RESPONSES = "responses.json"
+_RESPONSE_CB = "https://mint.example/w/cb"
+_RESPONSE_K1 = "a" * 64
+_RESPONSE_OUTPUTS = {"hash": "b" * 64, "cp1": encode_cp1(bytes([0x0B]) * 32)}
+_RESPONSE_CHANGES = {"hash": "c" * 64, "cp1": encode_cp1(bytes([0x0D]) * 32)}
+_RESPONSE_OUTCOMES = {
+    "pending": NotePending,
+    "spent": NoteSpent,
+    "unknown": NoteUnknown,
+    "ambiguous": AmbiguousMint,
+    "unverifiable": UnverifiableNote,
+}
+
+
+def _response_cases() -> list[tuple[dict, str]]:
+    """Each case with the call it goes through. A bare "mutation" is any of
+    the single-output mutations, so it goes through both of them: a merge owes
+    its output exactly what a rotate does."""
+    driven = []
+    for case in _cases(_RESPONSES, "cases"):
+        for via in ("rotate", "merge") if case["op"] == "mutation" else (case["op"],):
+            driven.append((case, via))
+    return driven
+
+
+def _answering(case: dict) -> httpx.MockTransport:
+    def answer(request: httpx.Request) -> httpx.Response:
+        if case.get("transportError"):
+            raise httpx.ConnectError("network error", request=request)
+        if case.get("timeout"):
+            raise httpx.ReadTimeout("timed out", request=request)
+        if "bodyRaw" in case:
+            return httpx.Response(case["http"], text=case["bodyRaw"])
+        return httpx.Response(case["http"], json=case["body"])
+
+    return httpx.MockTransport(answer)
+
+
+def _drive(case: dict, via: str):
+    # a kind this does not know is a vector this suite cannot grade, and
+    # reading it as a hash would pass it on no evidence
+    output = _RESPONSE_OUTPUTS[case.get("output", "hash")]
+    change = _RESPONSE_CHANGES[case.get("change", "hash")]
+    with httpx.Client(transport=_answering(case)) as http:
+        client = LnurlcashClient(client=http, mutation_retries=0)
+        if via == "melt":
+            return client.melt_note(_RESPONSE_CB, _RESPONSE_K1, "lnbc210n1pjq")
+        if via == "split":
+            return client.split_note_with_hash(
+                _RESPONSE_CB, [_RESPONSE_K1], 5000, output, change
+            )
+        if via == "merge":
+            return client.merge_notes_with_hash(_RESPONSE_CB, [_RESPONSE_K1], output)
+        assert via == "rotate", f"no call for op {via!r}"
+        return client.rotate_note_with_hash(_RESPONSE_CB, _RESPONSE_K1, output)
+
+
+def test_response_vectors_name_every_outcome_this_suite_grades():
+    vectors = load_vectors(_RESPONSES)
+    expected = {case["expect"] for case in vectors["cases"]}
+    assert expected <= set(vectors["outcomes"])
+    assert expected <= set(_RESPONSE_OUTCOMES) | {"ok", "error"}
+    # the cp1 cases are what this file exists to drive; losing them to a
+    # renamed field would pass every hash case and grade nothing
+    assert any(case.get("output") == "cp1" for case in vectors["cases"])
+    assert any(case.get("change") == "cp1" for case in vectors["cases"])
+
+
+@pytest.mark.parametrize(
+    "case,via",
+    _response_cases(),
+    ids=lambda v: v if isinstance(v, str) else f"{v['expect']}: {v['name']}",
+)
+def test_response_classification(case, via):
+    if case["expect"] == "ok":
+        result = _drive(case, via)
+        if via == "melt":
+            return
+        # Absent means none. A plain note is unsigned, so its signature is
+        # None rather than something this suite merely declined to check.
+        assert result.signature == case.get("signature")
+        if via == "split":
+            assert result.change_signature == case.get("changeSignature")
+        return
+    with pytest.raises(LnurlcashError) as raised:
+        _drive(case, via)
+    if case["expect"] == "error":
+        # a definitive refusal for some other reason must not be mistaken for
+        # one of the note-specific outcomes a holder acts on
+        assert isinstance(raised.value, ServiceRejected)
+        assert not isinstance(raised.value, (NotePending, NoteSpent, NoteUnknown))
+    else:
+        assert isinstance(raised.value, _RESPONSE_OUTCOMES[case["expect"]])
 
 
 # ---- bech32 ----
