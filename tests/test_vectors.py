@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import unicodedata
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
@@ -231,6 +232,88 @@ def test_response_classification(case, via):
         assert not isinstance(raised.value, (NotePending, NoteSpent, NoteUnknown))
     else:
         assert isinstance(raised.value, _RESPONSE_OUTCOMES[case["expect"]])
+
+
+# ---- the informational GET ----
+#
+# withdraw-info.json: what a note's informational GET may answer. Driven
+# through the real client over a mock transport, the way responses.json is,
+# for the vector's own queried URL, so the request the client builds is graded
+# alongside how it reads the answer: sig never reaches the SERVICE, and k1
+# goes out exactly as the note carried it.
+
+_WITHDRAW_INFO = "withdraw-info.json"
+
+
+def _drive_note_info(case: dict) -> tuple[object, dict[str, list[str]]]:
+    """What the client made of the case's body, a result or the error it
+    raised, and the query it sent to get it."""
+    queried = load_vectors(_WITHDRAW_INFO)["queriedUrl"]
+    sent: list[httpx.Request] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json=case["body"])
+
+    with httpx.Client(transport=httpx.MockTransport(answer)) as http:
+        try:
+            outcome: object = LnurlcashClient(client=http).fetch_note_info(queried)
+        except LnurlcashError as err:
+            outcome = err
+    assert len(sent) == 1, "one informational GET, and nothing else"
+    return outcome, parse_qs(sent[0].url.query.decode(), keep_blank_values=True)
+
+
+def _assert_sent_as_queried(query: dict[str, list[str]]) -> None:
+    vectors = load_vectors(_WITHDRAW_INFO)
+    queried = parse_qs(urlparse(vectors["queriedUrl"]).query, keep_blank_values=True)
+    for key in vectors["requestMustNotSend"]:
+        assert key not in query, f"sent {key}, which the SERVICE must never see"
+    for key in vectors["requestMustSendUnchanged"]:
+        assert query.get(key) == queried[key], f"{key} did not go out as queried"
+
+
+def test_withdraw_info_vectors_are_the_shape_this_suite_grades():
+    # a field this suite does not read is one nobody is grading
+    vectors = load_vectors(_WITHDRAW_INFO)
+    assert vectors["version"] == 1
+    assert set(vectors) == {
+        "version",
+        "spec",
+        "description",
+        "queriedUrl",
+        "requestMustNotSend",
+        "requestMustSendUnchanged",
+        "accepted",
+        "rejected",
+    }
+    for case in vectors["accepted"]:
+        assert set(case) <= {"name", "body", "maxWithdrawable", "why"}
+        assert "maxWithdrawable" in case
+    for case in vectors["rejected"]:
+        assert set(case) <= {"name", "body", "why"}
+
+
+@pytest.mark.parametrize(
+    "case", _cases(_WITHDRAW_INFO, "accepted"), ids=lambda c: c["name"]
+)
+def test_note_info_accepted(case):
+    info, sent = _drive_note_info(case)
+    _assert_sent_as_queried(sent)
+    assert not isinstance(info, LnurlcashError), f"refused: {info} ({case.get('why')})"
+    assert type(info.max_withdrawable) is int
+    assert info.max_withdrawable == case["maxWithdrawable"]
+
+
+@pytest.mark.parametrize(
+    "case", _cases(_WITHDRAW_INFO, "rejected"), ids=lambda c: c["name"]
+)
+def test_note_info_rejected(case):
+    outcome, sent = _drive_note_info(case)
+    _assert_sent_as_queried(sent)
+    assert isinstance(outcome, ProtocolError), (
+        f"got {outcome!r}, want a ProtocolError ({case.get('why')})"
+    )
 
 
 # ---- bech32 ----

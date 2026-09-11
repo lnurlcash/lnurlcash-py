@@ -27,7 +27,7 @@ from .errors import (
     UnverifiableNote,
     classify_note_error,
 )
-from .fees import MintFee, parse_mint_fee
+from .fees import _MAX_SAFE_INT, MintFee, parse_mint_fee
 from .bolt11 import decode_bolt11_amount_msat
 from .note import note_k1
 from .recoverable import is_cp1, note_id_of
@@ -282,6 +282,35 @@ def _optional_int(value: Any) -> int | None:
     return value
 
 
+def _msat(value: Any) -> int | None:
+    """An amount read exactly, or None: a JSON integer from 0 to 2^53 - 1.
+
+    json.loads never makes a fraction an int, so 21000.5 arrives as a float
+    and is refused here. A Python int has no ceiling, though, so a SERVICE
+    answering 18446744073709552000 would otherwise be taken at its word. Past
+    2^53 an integer is not guaranteed to mean the same number in every
+    implementation (RFC 8259, section 6), so the one a SERVICE wrote need not
+    be the one it meant, and it is refused rather than guessed at. The same
+    bound the fee parser applies, and lnurlcash-kit too.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value <= _MAX_SAFE_INT else None
+
+
+def _withdraw_amounts(body: dict) -> tuple[int, int]:
+    """A withdrawRequest's maxWithdrawable and minWithdrawable, each read by
+    :func:`_msat`. An absent or null minWithdrawable is zero. Anything else
+    that fails the read, or a minimum above the maximum, is not a
+    withdrawRequest."""
+    maximum = _msat(body.get("maxWithdrawable"))
+    raw_minimum = body.get("minWithdrawable")
+    minimum = 0 if raw_minimum is None else _msat(raw_minimum)
+    if maximum is None or minimum is None or minimum > maximum:
+        raise ProtocolError("Not a withdrawRequest (unexpected response).")
+    return maximum, minimum
+
+
 def _optional_str_tuple(value: Any) -> tuple[str, ...] | None:
     """Non-empty strings only, and None rather than an empty tuple for a list
     that had none: a caller testing ``is not None`` and one testing ``len()``
@@ -367,19 +396,9 @@ def note_info_request(url: str, policy: Policy = DEFAULT_POLICY) -> Request:
             raise ProtocolError("Not a withdrawRequest (unexpected response).")
         callback = body.get("callback")
         k1 = body.get("k1")
-        maximum = body.get("maxWithdrawable")
-        minimum = body.get("minWithdrawable", 0)
         if not isinstance(callback, str) or not isinstance(k1, str):
             raise ProtocolError("Not a withdrawRequest (unexpected response).")
-        if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 0:
-            raise ProtocolError("Not a withdrawRequest (unexpected response).")
-        if minimum is not None and (
-            not isinstance(minimum, int)
-            or isinstance(minimum, bool)
-            or minimum < 0
-            or minimum > maximum
-        ):
-            raise ProtocolError("Not a withdrawRequest (unexpected response).")
+        maximum, minimum = _withdraw_amounts(body)
         # Spec MUST: the response's k1 is the bearer secret itself, never a
         # derived or opaque id. A SERVICE returning something else for the k1
         # it was queried with is non-compliant - or the note was rotated by
@@ -408,7 +427,7 @@ def note_info_request(url: str, policy: Policy = DEFAULT_POLICY) -> Request:
             callback=callback,
             k1=k1.lower(),
             max_withdrawable=maximum,
-            min_withdrawable=minimum or 0,
+            min_withdrawable=minimum,
             default_description=body.get("defaultDescription"),
             mint_pubkey=mint_pubkey.strip().lower()
             if isinstance(mint_pubkey, str)
@@ -457,19 +476,9 @@ def note_info_by_hash_request(
         if not isinstance(body, dict) or body.get("tag") != "withdrawRequest":
             raise ProtocolError("Not a withdrawRequest (unexpected response).")
         callback = body.get("callback")
-        maximum = body.get("maxWithdrawable")
-        minimum = body.get("minWithdrawable", 0)
         if not isinstance(callback, str):
             raise ProtocolError("Not a withdrawRequest (unexpected response).")
-        if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 0:
-            raise ProtocolError("Not a withdrawRequest (unexpected response).")
-        if minimum is not None and (
-            not isinstance(minimum, int)
-            or isinstance(minimum, bool)
-            or minimum < 0
-            or minimum > maximum
-        ):
-            raise ProtocolError("Not a withdrawRequest (unexpected response).")
+        maximum, minimum = _withdraw_amounts(body)
         mint_pubkey = body.get("mintPubkey")
         if policy.require_mint_pubkey and not is_compressed_pubkey(mint_pubkey):
             raise ProtocolError(
@@ -482,7 +491,7 @@ def note_info_by_hash_request(
         return NoteInfoByHash(
             callback=callback,
             max_withdrawable=maximum,
-            min_withdrawable=minimum or 0,
+            min_withdrawable=minimum,
             default_description=body.get("defaultDescription"),
             mint_pubkey=mint_pubkey.strip().lower()
             if isinstance(mint_pubkey, str)

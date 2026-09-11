@@ -5,6 +5,18 @@ carry breaking changes; pin an exact version.
 
 ## 0.1.0 — unreleased
 
+### Amounts are read exactly
+
+- An informational GET, by secret or by hash, whose `maxWithdrawable` or
+  `minWithdrawable` is past 2^53 - 1 now raises `ProtocolError`. A Python int
+  has no ceiling, so 18446744073709552000 used to be taken at its word; past
+  2^53 the number a SERVICE wrote need not be the number it meant. The same
+  bound the fee parser and lnurlcash-kit already apply. A fraction was, and
+  is, refused.
+- Graded against `lnurlcash-conformance` 0.10.0's `withdraw-info.json`, every
+  case, through the client over a mock transport, including the request it
+  sends: `sig` stays behind and `k1` goes out unchanged.
+
 ### A plain note is unsigned
 
 LUD-25 Part 2 certifies `cp1` notes only: a plain hash has nothing to attest
