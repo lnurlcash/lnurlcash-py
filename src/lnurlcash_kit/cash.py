@@ -114,6 +114,16 @@ def _master_from(seed: bytes) -> CashNode:
     return CashNode(material[:32], material[32:])
 
 
+def derive_cash_master(seed: bytes) -> CashNode:
+    """The BIP-32 master node of a seed.
+
+    Public beside :func:`derive_cash_child` for the same reason: a consumer
+    walking a path this package does not name (nsec-tree's
+    ``m/44'/1237'/727'/0'/0'``, say) starts here.
+    """
+    return _master_from(seed)
+
+
 def derive_cash_root(seed: bytes) -> CashNode:
     """``m/139'`` - the wallet's own root for note secrets, under its own
     purpose so it never shares key material with LUD-05's ``m/138'``

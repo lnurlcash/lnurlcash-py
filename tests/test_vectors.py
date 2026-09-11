@@ -4,7 +4,11 @@ to the library's functions."""
 
 from __future__ import annotations
 
+import hashlib
+import unicodedata
+
 import pytest
+from coincurve import PrivateKey, PublicKey
 
 from conftest import load_vectors
 from lnurlcash_kit.protocol import (
@@ -15,17 +19,44 @@ from lnurlcash_kit.protocol import (
     verify_request,
 )
 from lnurlcash_kit import (
+    NOSTR_CASH_SEED_LABEL,
+    Cx1,
     MintFee,
     cash_domain_indices,
     cash_node_from_hex,
+    cash_node_to_cx1,
     cash_node_to_hex,
     cash_secret_at,
+    decode_ck1,
+    decode_cp1,
+    decode_cs1,
+    decode_cx1,
+    derive_cash_address_node,
     derive_cash_child,
     derive_cash_domain_node,
     derive_cash_root,
     derive_cash_secret,
+    derive_note_pubkey,
     derive_note_root,
     derive_note_secret,
+    derive_note_secret_key,
+    derive_nostr_address_node,
+    derive_nostr_cash_seed,
+    encode_ck1,
+    encode_cp1,
+    encode_cs1,
+    encode_cx1,
+    is_ck1,
+    is_cp1,
+    is_cs1,
+    is_cx1,
+    note_id_of,
+    note_lookup_of,
+    note_signature_digest_for_hash,
+    note_signature_message_for_hash,
+    recover_note_ownership_pubkey,
+    sign_note_ownership,
+    verify_note_signature_hash,
     hash_k1,
     ProtocolError,
     RequestRefused,
@@ -410,3 +441,246 @@ def test_legacy_derivation(case):
     k1 = derive_note_secret(root, case["host"], case["index"])
     assert k1 == case["k1"]
     assert hash_k1(k1) == case["noteId"]
+
+
+# ---- LUD-25 Part 2 ----
+#
+# part2.json: notes keyed by a public key and spent by a recoverable
+# signature. Every field of every branch, note and certificate is bound to the
+# library here, including recovering each ck1 to its note key and each cs1 to
+# the mint's. A disagreement is a note one implementation mints and another
+# cannot find, or cannot spend.
+
+_PART2 = "part2.json"
+_HARDENED = 0x80000000
+_CURVE_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+_PART2_DECODERS = {
+    "cp1": decode_cp1,
+    "ck1": decode_ck1,
+    "cs1": decode_cs1,
+    "cx1": decode_cx1,
+}
+_PART2_TESTS = {"cp1": is_cp1, "ck1": is_ck1, "cs1": is_cs1, "cx1": is_cx1}
+
+
+def _bip39_seed(mnemonic: str) -> bytes:
+    """BIP-39's phrase-to-seed step, with no passphrase.
+
+    The library deliberately takes raw seed bytes and never a phrase, which
+    keeps a wordlist out of every consumer's environment. But the vectors
+    carry the phrase too, so the step that joins the two is graded here rather
+    than taken on trust.
+    """
+    phrase = unicodedata.normalize("NFKD", mnemonic).encode("utf-8")
+    return hashlib.pbkdf2_hmac("sha512", phrase, b"mnemonic", 2048)
+
+
+def _branch_id(branch: dict) -> str:
+    return f"{branch['mnemonic'].split()[0]}/{branch['host']}"
+
+
+def _part2_notes() -> list[tuple[dict, dict]]:
+    return [(b, n) for b in _cases(_PART2, "branches") for n in b["notes"]]
+
+
+def test_part2_conventions_are_the_ones_this_library_implements():
+    conventions = load_vectors(_PART2)["conventions"]
+    # the reference wallet's path, not the spec text's; see
+    # derive_cash_address_node for why that is the one that restores anything
+    assert conventions["addressBranch"] == "m/139'/1'/d1/d2/d3/d4"
+    assert conventions["hashingKey"] == "m/139'/1'/0"
+    assert conventions["ownershipMessage"] == "LNURLcash"
+    assert conventions["certificateMessage"] == "LNURLcash:<amount_msat>:<hex(pk)>"
+    assert conventions["signatureLayout"].startswith("r || s || recovery id")
+    assert conventions["indexWidth"].startswith("4 bytes, big-endian")
+    # the digest itself is bound in test_part2_note, by recovering the
+    # library's own signatures against it
+
+
+def test_part2_covers_both_branch_parities_and_the_whole_index_range():
+    # an odd-parity branch is the only thing that exercises the negation in
+    # derive_note_secret_key, and 2^31 and 2^32 - 1 are where an
+    # implementation that hardens or narrows the index shows itself
+    branches = load_vectors(_PART2)["branches"]
+    assert {b["branchParity"] for b in branches} == {"even", "odd"}
+    for branch in branches:
+        indices = [n["index"] for n in branch["notes"]]
+        assert _HARDENED in indices and 0xFFFFFFFF in indices
+
+
+@pytest.mark.parametrize("branch", _cases(_PART2, "branches"), ids=_branch_id)
+def test_part2_branch(branch):
+    seed = _bip39_seed(branch["mnemonic"])
+    assert seed.hex() == branch["seedHex"]
+    root = derive_cash_root(seed)
+    assert cash_node_to_hex(root) == branch["cashRoot"]
+
+    # d1..d4 hang off m/139'/1', one level below where the Part 1 ladder's do
+    address_root = derive_cash_child(root, 1 + _HARDENED)
+    assert list(cash_domain_indices(address_root, branch["host"])) == branch["domainIndices"]
+
+    node = derive_cash_address_node(root, branch["host"])
+    assert cash_node_to_hex(node) == branch["addressNode"]
+    assert cash_node_to_hex(node) != cash_node_to_hex(
+        derive_cash_domain_node(root, branch["host"])
+    )
+
+    cx1 = cash_node_to_cx1(node)
+    assert cx1.pubkey_x_only.hex() == branch["branchPubkey"]
+    assert cx1.chain_code.hex() == branch["chainCode"]
+    prefix = PrivateKey(node.private_key).public_key.format(compressed=True)[0]
+    assert ("even" if prefix == 0x02 else "odd") == branch["branchParity"]
+    assert encode_cx1(cx1.pubkey_x_only, cx1.chain_code) == branch["cx1"]
+    assert decode_cx1(branch["cx1"]) == cx1
+    assert is_cx1(branch["cx1"])
+
+
+@pytest.mark.parametrize(
+    "branch,note",
+    _part2_notes(),
+    ids=lambda v: _branch_id(v) if "mnemonic" in v else f"#{v['index']}",
+)
+def test_part2_note(branch, note):
+    index = note["index"]
+    node = cash_node_from_hex(branch["addressNode"])
+
+    # the watcher's half, from nothing but the cx1
+    watched = decode_cx1(branch["cx1"])
+    assert watched is not None
+    pk = derive_note_pubkey(watched.pubkey_x_only, watched.chain_code, index)
+    assert pk.hex() == note["notePubkey"]
+
+    # the holder's half, and that it is the key the watcher derived
+    sk = derive_note_secret_key(node.private_key, node.chain_code, index)
+    assert sk.hex() == note["noteSecretKey"]
+    assert PrivateKey(sk).public_key.format(compressed=True)[1:] == pk
+
+    assert encode_cp1(pk) == note["cp1"]
+    assert decode_cp1(note["cp1"]) == pk
+
+    # RFC6979 and low-S, so re-deriving the key reproduces the ck1 byte for byte
+    signature = sign_note_ownership(sk)
+    assert signature.hex() == note["ownershipSignature"]
+    assert signature[64] <= 3
+    assert int.from_bytes(signature[32:64], "big") <= _CURVE_N // 2
+    assert encode_ck1(signature) == note["ck1"]
+    assert decode_ck1(note["ck1"]) == signature
+
+    # Recovered twice: through the library, and straight off the vector's own
+    # digest, which pins exactly what the library signs over.
+    assert recover_note_ownership_pubkey(signature) == pk
+    digest = bytes.fromhex(load_vectors(_PART2)["conventions"]["ownershipDigest"])
+    recovered = PublicKey.from_signature_and_message(
+        decode_ck1(note["ck1"]), digest, hasher=None
+    )
+    assert recovered.format(compressed=True)[1:] == pk
+
+    assert note_id_of(note["ck1"]) == note["notePubkey"]
+    assert note_id_of(note["ck1"].upper()) == note["notePubkey"]
+    assert note_lookup_of(note["ck1"]) == note["cp1"]
+
+
+@pytest.mark.parametrize(
+    "cert", _cases(_PART2, "certificates"), ids=lambda c: f"{c['amountMsat']}msat"
+)
+def test_part2_certificate(cert):
+    vectors = load_vectors(_PART2)
+    mint = vectors["mint"]
+    mint_key = PrivateKey(bytes.fromhex(mint["privateKey"]))
+    assert mint_key.public_key.format(compressed=True).hex() == mint["mintPubkey"]
+
+    note_pubkey, amount = cert["notePubkey"], cert["amountMsat"]
+    assert note_signature_message_for_hash(note_pubkey, amount) == cert["message"]
+    digest = note_signature_digest_for_hash(note_pubkey, amount)
+    assert digest.hex() == cert["digest"]
+
+    signature = bytes.fromhex(cert["signature"])
+    # the mint's side is as deterministic as the holder's
+    assert mint_key.sign_recoverable(digest, hasher=None) == signature
+    assert encode_cs1(signature) == cert["cs1"]
+    assert decode_cs1(cert["cs1"]) == signature
+    recovered = PublicKey.from_signature_and_message(signature, digest, hasher=None)
+    assert recovered.format(compressed=True).hex() == mint["mintPubkey"]
+
+    # a watcher's check, holding only the key, in either spelling
+    assert verify_note_signature_hash(note_pubkey, amount, cert["cs1"], mint["mintPubkey"])
+    assert verify_note_signature_hash(note_pubkey, amount, cert["signature"], mint["mintPubkey"])
+
+    # and a recipient's, holding the ck1: the id is recovered, offline
+    ck1 = next(
+        n["ck1"]
+        for b in vectors["branches"]
+        for n in b["notes"]
+        if n["notePubkey"] == note_pubkey
+    )
+    assert note_signature_message(ck1, amount) == cert["message"]
+    assert note_signature_digest(ck1, amount).hex() == cert["digest"]
+    assert verify_note_signature(ck1, amount, cert["cs1"], mint["mintPubkey"])
+    assert not verify_note_signature(ck1, amount + 1, cert["cs1"], mint["mintPubkey"])
+
+
+@pytest.mark.parametrize(
+    "case", _cases(_PART2, "valid"), ids=lambda c: f"{c['type']}: {c['why']}"
+)
+def test_part2_accepts(case):
+    decoded = _PART2_DECODERS[case["type"]](case["value"])
+    if isinstance(decoded, Cx1):
+        decoded = decoded.pubkey_x_only + decoded.chain_code
+    assert decoded is not None and decoded.hex() == case["bytes"]
+    assert _PART2_TESTS[case["type"]](case["value"]) is True
+
+
+@pytest.mark.parametrize(
+    "case", _cases(_PART2, "invalid"), ids=lambda c: f"{c['type']}: {c['why']}"
+)
+def test_part2_refuses(case):
+    assert case["why"]
+    assert _PART2_DECODERS[case["type"]](case["value"]) is None
+    assert _PART2_TESTS[case["type"]](case["value"]) is False
+
+
+# ---- a Part 2 branch rooted in a Nostr key ----
+#
+# nostr-seed.json is an extension, not LUD-25, and says so. heartwood-esp32
+# derives the same branch on the device, so the two have to agree on every
+# value from one identity key or its notes do not come back from the nsec.
+
+
+def test_nostr_seed_is_marked_as_an_extension():
+    spec = load_vectors("nostr-seed.json")
+    assert spec["extension"] is True
+    assert spec["label"] == NOSTR_CASH_SEED_LABEL
+
+
+@pytest.mark.parametrize(
+    "case",
+    _cases("nostr-seed.json", "cases"),
+    ids=lambda c: f"{c['identityPubkey'][:8]}/{c['host']}",
+)
+def test_nostr_seed(case):
+    identity = bytes.fromhex(case["identity"])
+    # the key the lightning address's npub encodes
+    public = PrivateKey(identity).public_key.format(compressed=True)[1:]
+    assert public.hex() == case["identityPubkey"]
+
+    seed = derive_nostr_cash_seed(identity)
+    assert seed.hex() == case["seed"]
+    node = derive_nostr_address_node(identity, case["host"])
+    assert cash_node_to_hex(node) == case["addressNode"]
+    # nothing but the ordinary address path from that seed
+    plain = derive_cash_address_node(derive_cash_root(seed), case["host"])
+    assert cash_node_to_hex(plain) == case["addressNode"]
+
+    cx1 = cash_node_to_cx1(node)
+    assert encode_cx1(cx1.pubkey_x_only, cx1.chain_code) == case["cx1"]
+    assert decode_cx1(case["cx1"]) == cx1
+
+    assert case["notes"]
+    for note in case["notes"]:
+        sk = derive_note_secret_key(node.private_key, node.chain_code, note["index"])
+        assert sk.hex() == note["noteSecretKey"]
+        pk = derive_note_pubkey(cx1.pubkey_x_only, cx1.chain_code, note["index"])
+        assert pk.hex() == note["notePubkey"]
+        assert encode_cp1(pk) == note["cp1"]
+        assert encode_ck1(sign_note_ownership(sk)) == note["ck1"]
+        assert note_id_of(note["ck1"]) == note["notePubkey"]

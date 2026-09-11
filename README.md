@@ -194,6 +194,70 @@ upwards only. `note_info_by_hash_request` is the private lookup a walk should
 use; asking by secret publishes the very indices the wallet is about to mint
 under.
 
+## Notes keyed by a public key (LUD-25 Part 2)
+
+A Part 2 note swaps the hash for a key pair. The wallet keeps `sk`. The mint
+only ever sees `pk`, written `cp1…`. To spend the note you hand over `ck1…`, a
+recoverable signature by `sk` over the fixed message `LNURLcash`, and the mint
+recovers `pk` from it to find the note. The mint's certificate, `cs1…`, is the
+same signature mints already make, over `hex(pk)` instead of a hash. So a
+recipient can check a note offline with nothing but `ck1` and `cs1`.
+
+The protocol calls take both kinds. A `ck1` goes anywhere a `k1` does: a note
+URL, `fetch_note_info`, rotate, split, merge and melt. A `cp1` goes anywhere an
+output does: `mint_invoice_request_with_hash`, and the output of every
+`*_with_hash` call, where it is sent as `p1`/`p2` while a hash keeps `h`/`h2`,
+the same rule as lnurl-wallet. `note_id_of(k1)` gives the id a mint files
+either kind under, and `note_lookup_of(k1)` what to pass
+`note_info_by_hash_request` to check a note without disclosing it. For a Part
+2 note that answer carries the note's `cs1` as `signature`.
+
+```python
+from lnurlcash_kit import (
+    cash_node_to_cx1, derive_cash_address_node, derive_cash_root,
+    derive_note_pubkey, derive_note_secret_key, encode_ck1, encode_cp1,
+    encode_cx1, sign_note_ownership, verify_note_signature,
+)
+
+node = derive_cash_address_node(derive_cash_root(seed), "mint.example")
+branch = cash_node_to_cx1(node)
+watch_only = encode_cx1(branch.pubkey_x_only, branch.chain_code)
+
+pk = derive_note_pubkey(branch.pubkey_x_only, branch.chain_code, i)  # what a watcher derives
+sk = derive_note_secret_key(node.private_key, node.chain_code, i)
+ck1 = encode_ck1(sign_note_ownership(sk))                            # the bearer secret
+
+client.rotate_note_with_hash(callback, ck1, encode_cp1(next_pk))     # sent as p1
+verify_note_signature(ck1, amount_msat, cs1, mint_pubkey)            # offline
+```
+
+Three things worth knowing:
+
+- **The branch path follows the reference wallet, not the spec text.** It is
+  `m/139'/1'/d1/d2/d3/d4`, with the hashing key at `m/139'/1'/0`. The spec
+  says `m/139'/d1..d4`, which is the node the Part 1 ladder already uses, and
+  a wallet following it finds none of lnurl-wallet's notes.
+- **A `cx1` links every note on its branch.** It cannot spend anything, but
+  whoever holds it can list every key on the branch and ask the mint about
+  each one. Register it with a mint and that mint sees everything paid to the
+  address. Use the branch for receiving and rotate off it.
+- **One note, many `ck1` strings.** This library's `ck1` for a key is the same
+  every time, because RFC6979 makes it so, but any valid signature by `sk`
+  spends the note. Compare notes by `note_id_of`, never by the string.
+
+**A branch rooted in a Nostr key.** This one is ours, not LUD-25's. A holder
+with no BIP-39 words, such as a hardware signer that keeps only its identity
+key, can still be paid to keys of its own. `derive_nostr_address_node(secret_key,
+host)` takes the branch from the key behind the lightning address's npub:
+`HMAC-SHA256(key = secret key, msg = "LNURLcash/nostr-seed")`, then the path
+above unchanged. heartwood-esp32 derives the same branch on the device, so its
+notes come back from the nsec without the device. A mint sees an ordinary
+`cx1` either way.
+
+Both are graded against lnurlcash-conformance's `vectors/part2.json` and
+`vectors/nostr-seed.json`: every branch, key, signature, certificate and
+string in them.
+
 ## Errors
 
 | Class | Means |
