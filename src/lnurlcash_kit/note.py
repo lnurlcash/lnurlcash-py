@@ -5,6 +5,7 @@ from __future__ import annotations
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from .errors import ProtocolError
+from .recoverable import is_cp1, note_id_of
 from .secrets import is_preimage
 from .urls import from_lud17, resolve_lnurl_input
 
@@ -79,13 +80,15 @@ def note_signature(url: str) -> str | None:
 
 def resolve_note_input(value: str) -> str | None:
     """Input only qualifies as a note if it resolves to a URL carrying a
-    well-formed k1: 32 bytes hex. A k1 that is not hex would raise during
-    hashing later, so it is refused at the door."""
+    well-formed k1: 32 bytes hex, or a Part 2 ck1 that recovers to a key.
+    Anything else would raise during hashing later, so it is refused at the
+    door. A cp1 is a note's public key, not its secret, so it does not
+    qualify."""
     url = resolve_lnurl_input(value)
     if not url:
         return None
     k1 = note_k1(url)
-    if not k1 or not is_preimage(k1):
+    if not k1 or note_id_of(k1) is None:
         return None
     return url
 
@@ -127,13 +130,20 @@ def build_note_info_url_by_hash(withdraw_link: str, h: str) -> str:
     unknown ``k1``, which LUD-25 requires, so a rejection here never
     distinguishes "not supported" from "no such note" - and a burned note is
     deliberately indistinguishable from one that never existed.
+
+    ``h`` may also be a Part 2 cp1 key, sent as ``p``, the name LUD-25 now
+    uses. A hash keeps the older ``h``, which every mint that ever took a hash
+    lookup understands. Same rule as lnurl-wallet, decided per value rather
+    than by a version flag. :func:`~lnurlcash_kit.recoverable.note_lookup_of`
+    gives the right one for either kind of k1.
     """
-    hash_hex = h.strip().lower()
-    if not is_preimage(hash_hex):
-        raise ProtocolError("a note hash must be 32 bytes of hex")
+    value = h.strip().lower()
+    key = is_cp1(value)
+    if not key and not is_preimage(value):
+        raise ProtocolError("a note hash must be 32 bytes of hex, or a cp1 key")
     url = from_lud17(withdraw_link.strip())
     pairs = [(k, v) for k, v in _query_pairs(url) if k not in ("k1", "amount", "sig")]
-    pairs.append(("h", hash_hex))
+    pairs.append(("p" if key else "h", value))
     return _rebuild(url, pairs)
 
 

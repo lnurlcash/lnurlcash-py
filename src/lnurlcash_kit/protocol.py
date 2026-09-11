@@ -30,6 +30,7 @@ from .errors import (
 from .fees import MintFee, parse_mint_fee
 from .bolt11 import decode_bolt11_amount_msat
 from .note import note_k1
+from .recoverable import is_cp1, note_id_of
 from .secrets import generate_note_secret, hash_k1, is_preimage
 from .urls import is_allowed_service_url
 
@@ -103,6 +104,12 @@ class WithdrawRequestInfo:
     #: always publishes the key its notes verify against here. Only ever None
     #: when the caller passed a Policy with ``require_signatures`` false.
     mint_pubkey: str | None = None
+    #: the response's ``sig``: for a Part 2 note, the SERVICE's ready-made
+    #: cs1 certificate for its current amount, so a holder need not force a
+    #: rotate just to get one. Passed on as sent and never checked here -
+    #: :func:`~lnurlcash_kit.signature.verify_note_signature` is the check.
+    #: None when the SERVICE sent none, which is normal for a Part 1 note
+    signature: str | None = None
 
 
 @dataclass(frozen=True)
@@ -122,6 +129,9 @@ class NoteInfoByHash:
     min_withdrawable: int = 0
     default_description: str | None = None
     mint_pubkey: str | None = None
+    #: as on :class:`WithdrawRequestInfo`: a Part 2 note's cs1, which is what
+    #: makes a lookup by cp1 enough to rebuild a verifiable note on restore
+    signature: str | None = None
 
 
 @dataclass(frozen=True)
@@ -287,6 +297,14 @@ def _optional_iso_date(value: Any) -> str | None:
     return value if parsed.isoformat() == value else None
 
 
+def _optional_signature(body: dict) -> str | None:
+    """An informational GET's ``sig``, or nothing. Display and verification
+    material only, so a SERVICE sending something that is not a string gets
+    it dropped rather than the whole response refused."""
+    value = body.get("sig")
+    return value if isinstance(value, str) and value else None
+
+
 def _reject_error(body: Any) -> None:
     """A SERVICE's ERROR is definitive. The reason is carried through exactly
     as sent, empty included - see classify_note_error for why substituting a
@@ -297,6 +315,22 @@ def _reject_error(body: Any) -> None:
 
 
 # ---- the informational GET ----
+
+
+def _same_note(a: str, b: str) -> bool:
+    """Whether two k1s name one note.
+
+    A Part 1 secret has one spelling, but a Part 2 note has as many valid ck1s
+    as a signer has nonces - and anyone can flip a signature to its high-S
+    twin - so a SERVICE echoing a different ck1 that recovers to the same key
+    has named the same note, not a different one. Every LNURLcash kit compares
+    the echo this way. Anything that is not a note at all still has to match
+    as text, as it always did.
+    """
+    if a.strip().lower() == b.strip().lower():
+        return True
+    id_a, id_b = note_id_of(a), note_id_of(b)
+    return id_a is not None and id_a == id_b
 
 
 def note_info_request(url: str, policy: Policy = DEFAULT_POLICY) -> Request:
@@ -336,8 +370,9 @@ def note_info_request(url: str, policy: Policy = DEFAULT_POLICY) -> Request:
         # Spec MUST: the response's k1 is the bearer secret itself, never a
         # derived or opaque id. A SERVICE returning something else for the k1
         # it was queried with is non-compliant - or the note was rotated by
-        # somebody else, which matters more.
-        if queried and k1.lower() != queried:
+        # somebody else, which matters more. "Something else" means another
+        # note, not another spelling of this one: see _same_note.
+        if queried and not _same_note(k1, queried):
             raise ProtocolError(
                 "The service echoed back a different k1 than was queried - the "
                 "note may have been redeemed elsewhere, or the service isn't "
@@ -365,6 +400,7 @@ def note_info_request(url: str, policy: Policy = DEFAULT_POLICY) -> Request:
             mint_pubkey=mint_pubkey.strip().lower()
             if isinstance(mint_pubkey, str)
             else None,
+            signature=_optional_signature(body),
         )
 
     return Request(url=request_url, parse=parse)
@@ -383,6 +419,11 @@ def note_info_by_hash_request(
     A rejection means nothing on its own. A SERVICE that does not index by hash
     must answer as it would for an unknown ``k1``, and so must one answering
     for a note that was burned, so only a positive answer is evidence.
+
+    ``h`` may be a Part 2 cp1 instead, sent as ``p``: see
+    :func:`~lnurlcash_kit.note.build_note_info_url_by_hash`, and
+    :func:`~lnurlcash_kit.recoverable.note_lookup_of` for the right value to
+    pass for either kind of note.
 
     Differs from :func:`note_info_request` in exactly two places, both because
     there was no secret in the request: ``k1`` is not required in the response,
@@ -432,6 +473,7 @@ def note_info_by_hash_request(
             mint_pubkey=mint_pubkey.strip().lower()
             if isinstance(mint_pubkey, str)
             else None,
+            signature=_optional_signature(body),
         )
 
     return Request(url=request_url, parse=parse)
@@ -473,6 +515,10 @@ def mint_address_request(url: str) -> Request:
 
 
 # ---- the mutating callback ----
+#
+# Every ``k1`` here may be a Part 1 secret or a Part 2 ck1. The SERVICE tells
+# them apart by shape, so both pass through untouched, and one merge may mix
+# the two kinds. Every output may be a hash or a cp1: see _output_param.
 
 
 def _parse_success(body: Any) -> dict:
@@ -549,10 +595,24 @@ def melt_request(callback: str, k1: str, pr: str) -> Request:
     return Request(url=url, parse=parse)
 
 
+def _output_param(value: str, which: int) -> tuple[str, str]:
+    """An output is a hash, or a Part 2 cp1 key.
+
+    LUD-25 renamed the callback's ``h``/``h2`` to ``p1``/``p2``. A hash keeps
+    the old names, which every mint accepts, and a key goes as ``p1``/``p2``,
+    which only a Part 2 mint takes anyway. Decided per value, never by a
+    version flag, which is lnurl-wallet's rule. The value itself goes out as
+    given, so a retry is byte-identical to the request it repeats.
+    """
+    if is_cp1(value.strip().lower()):
+        return (f"p{which}", value)
+    return ("h" if which == 1 else "h2", value)
+
+
 def rotate_request_with_hash(
     callback: str, k1: str, h: str, policy: Policy = DEFAULT_POLICY
 ) -> Request:
-    url = _callback(callback, [("k1", k1), ("h", h)])
+    url = _callback(callback, [("k1", k1), _output_param(h, 1)])
 
     def parse(body: Any) -> MutationResult:
         ok = _parse_success(body)
@@ -574,7 +634,7 @@ def split_request_with_hash(
     url = _callback(
         callback,
         [("k1", k1) for k1 in k1s]
-        + [("amount", str(amount_msat)), ("h", h), ("h2", h2)],
+        + [("amount", str(amount_msat)), _output_param(h, 1), _output_param(h2, 2)],
     )
 
     def parse(body: Any) -> MutationResult:
@@ -594,7 +654,7 @@ def split_request_with_hash(
 def merge_request_with_hash(
     callback: str, k1s: list[str], h: str, policy: Policy = DEFAULT_POLICY
 ) -> Request:
-    url = _callback(callback, [("k1", k1) for k1 in k1s] + [("h", h)])
+    url = _callback(callback, [("k1", k1) for k1 in k1s] + [_output_param(h, 1)])
 
     def parse(body: Any) -> MutationResult:
         ok = _parse_success(body)
@@ -765,23 +825,30 @@ def mint_invoice_request_with_hash(
     point of the current draft: a preimage propagates to every routing node
     that forwards the payment, and a note keyed by one is a note they can all
     spend.
+
+    ``h`` may instead be a Part 2 cp1, minting a note keyed by that public
+    key. It goes as the comment alone: ``h`` is a hash-only extension, and a
+    mint may refuse a key under it.
     """
+    # lowercase for the same reason a note's k1 is normalised: it is bytes,
+    # not text, and a SERVICE storing notes under what it was given should be
+    # given one spelling of it
     h = h.strip().lower()
-    # Refused here rather than sent, so a WALLET never pays for a quote the
-    # SERVICE was always going to reject.
-    if not is_preimage(h):
+    if is_cp1(h):
+        params = [("amount", str(amount_msat)), ("comment", h)]
+    elif is_preimage(h):
+        params = [("amount", str(amount_msat)), ("comment", h), ("h", h)]
+    else:
+        # Refused here rather than sent, so a WALLET never pays for a quote
+        # the SERVICE was always going to reject.
         raise RequestRefused(
-            "An output commitment must be 32 bytes of hex "
+            "An output must be 32 bytes of hex or a cp1 key "
             "- no invoice was requested."
         )
     # The response shape is an ordinary LUD-06 invoice; reuse its parser
     # rather than restating it.
     inner = invoice_request(pay_callback, amount_msat)
-    url = _with_params(
-        pay_callback,
-        [("amount", str(amount_msat)), ("comment", h), ("h", h)],
-    )
-    return Request(url=url, parse=inner.parse)
+    return Request(url=_with_params(pay_callback, params), parse=inner.parse)
 
 
 def mint_invoice_request(

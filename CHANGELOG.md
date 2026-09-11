@@ -5,6 +5,56 @@ carry breaking changes; pin an exact version.
 
 ## 0.1.0 — unreleased
 
+### LUD-25 Part 2: notes keyed by a public key
+
+A Part 2 note is keyed by a public key rather than a hash. The holder keeps
+`sk`, discloses `pk` as `cp1`, and spends the note with `ck1`, a recoverable
+signature by `sk`; the mint recovers `pk` from it. The new
+`lnurlcash_kit.recoverable` carries lnurlcash-kit's TypeScript names in
+snake_case.
+
+- The four bech32m encodings: `cp1` (a note's key), `ck1` (its bearer secret),
+  `cs1` (the mint's certificate) and `cx1` (a watch-only branch), with
+  `encode_*`, `decode_*` and `is_*` for each. Fixed lengths and no 90-character
+  limit; all-uppercase is accepted and mixed case refused. Decoders return
+  `None` rather than raise.
+- `bech32` gains bech32m, BIP-350's constant beside BIP-173's. LUD-01 decoding
+  is unchanged, and neither accepts the other's checksum.
+- `derive_note_pubkey` (watch-only) and `derive_note_secret_key`, the per-note
+  key tweak. The index is any uint32. A tweak at or above n, or a zero key,
+  raises rather than being reduced: use the next index.
+- `sign_note_ownership` and `recover_note_ownership_pubkey`.
+- `derive_cash_address_node` and `cash_node_to_cx1`. The branch is
+  `m/139'/1'/d1..d4`, which is what lnurl-wallet derives, not the
+  `m/139'/d1..d4` the spec text gives.
+- `note_id_of(k1)`, the id a mint files either kind of note under, and
+  `note_lookup_of(k1)`, what to look it up by without disclosing it. One note
+  has many valid `ck1` strings, so notes compare by id.
+- `note_info_request` compares an echoed `k1` by the note it names, as every
+  LNURLcash kit does. A SERVICE echoing another valid `ck1` for the same note,
+  such as its high-S twin, is not mistaken for one that swapped the note; a
+  different note is still refused.
+- The wire takes both kinds. A `ck1` goes anywhere a `k1` does, and
+  `resolve_note_input` accepts a note URL carrying one. A `cp1` output goes as
+  `p1`/`p2` from the `*_with_hash` calls while a hash keeps `h`/`h2`;
+  `mint_invoice_request_with_hash` sends one as the comment alone, and
+  `build_note_info_url_by_hash` as `p`.
+- `verify_note_signature` takes a `ck1` and a `cs1`.
+  `verify_note_signature_hash`, `note_signature_message_for_hash` and
+  `note_signature_digest_for_hash` do the same for a caller holding only the
+  key, as a `cx1` watcher does. `note_signature_message` now raises
+  `ProtocolError` for a k1 that is neither kind.
+- `WithdrawRequestInfo` and `NoteInfoByHash` carry the response's `sig` as
+  `signature`: for a Part 2 note, the mint's ready-made `cs1`.
+- `derive_cash_master(seed)`, the BIP-32 master node.
+- An extension, not LUD-25: `derive_nostr_cash_seed` and
+  `derive_nostr_address_node`, a Part 2 branch rooted in a Nostr identity key
+  (`HMAC-SHA256(key, "LNURLcash/nostr-seed")`, then the same path), as
+  heartwood-esp32 derives it.
+- Graded against `lnurlcash-conformance` 0.9.0's `part2.json` and
+  `nostr-seed.json`: every field of every branch, note and certificate,
+  including recovering each `ck1` to its key and each `cs1` to the mint's.
+
 ### Three more fields off a mint address
 
 `mint_address_request` reads `nodeUris`, `sunsetDate` and

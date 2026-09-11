@@ -9,6 +9,10 @@ Whoever knows the k1 controls the sats behind it, like a banknote. The
 ``amount`` alongside it is only a claim by whoever encoded the note; the
 authoritative value is always ``maxWithdrawable`` from an informational GET.
 
+A LUD-25 Part 2 note is the same link keyed by a public key instead: its k1 is
+a ``ck1``, a recoverable signature the mint recovers the key from. See
+:mod:`lnurlcash_kit.recoverable`.
+
 Draft spec: https://github.com/lnurl/luds/pull/301
 
 Reference implementations, both by dni and both MIT:
@@ -77,8 +81,35 @@ from .cash import (
     cash_secret_at,
     derive_cash_child,
     derive_cash_domain_node,
+    derive_cash_master,
     derive_cash_root,
     derive_cash_secret,
+)
+from .recoverable import (
+    NOSTR_CASH_SEED_LABEL,
+    Cx1,
+    cash_node_to_cx1,
+    decode_ck1,
+    decode_cp1,
+    decode_cs1,
+    decode_cx1,
+    derive_cash_address_node,
+    derive_note_pubkey,
+    derive_note_secret_key,
+    derive_nostr_address_node,
+    derive_nostr_cash_seed,
+    encode_ck1,
+    encode_cp1,
+    encode_cs1,
+    encode_cx1,
+    is_ck1,
+    is_cp1,
+    is_cs1,
+    is_cx1,
+    note_id_of,
+    note_lookup_of,
+    recover_note_ownership_pubkey,
+    sign_note_ownership,
 )
 from .secrets import (
     derive_note_root,
@@ -89,8 +120,11 @@ from .secrets import (
 )
 from .signature import (
     note_signature_digest,
+    note_signature_digest_for_hash,
     note_signature_message,
+    note_signature_message_for_hash,
     verify_note_signature,
+    verify_note_signature_hash,
 )
 from .urls import (
     from_bech32_lnurl,
@@ -163,13 +197,41 @@ __all__ = [
     "cash_secret_at",
     "derive_cash_child",
     "derive_cash_domain_node",
+    "derive_cash_master",
     "derive_cash_root",
     "derive_cash_secret",
     "derive_note_root",
     "derive_note_secret",
+    "NOSTR_CASH_SEED_LABEL",
+    "Cx1",
+    "cash_node_to_cx1",
+    "decode_ck1",
+    "decode_cp1",
+    "decode_cs1",
+    "decode_cx1",
+    "derive_cash_address_node",
+    "derive_note_pubkey",
+    "derive_note_secret_key",
+    "derive_nostr_address_node",
+    "derive_nostr_cash_seed",
+    "encode_ck1",
+    "encode_cp1",
+    "encode_cs1",
+    "encode_cx1",
+    "is_ck1",
+    "is_cp1",
+    "is_cs1",
+    "is_cx1",
+    "note_id_of",
+    "note_lookup_of",
+    "recover_note_ownership_pubkey",
+    "sign_note_ownership",
     "note_signature_digest",
+    "note_signature_digest_for_hash",
     "note_signature_message",
+    "note_signature_message_for_hash",
     "verify_note_signature",
+    "verify_note_signature_hash",
     "decode_bolt11_amount_msat",
     "is_bolt11_invoice",
     "same_invoice",
