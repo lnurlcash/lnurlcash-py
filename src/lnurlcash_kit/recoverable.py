@@ -86,8 +86,10 @@ def is_ck1(value: str) -> bool:
 
 
 def encode_cs1(signature: bytes) -> str:
-    """A SERVICE's issuance certificate: the same 65-byte layout, signed by
-    the mint. Authorises nothing on its own."""
+    """A legacy fixed-prefix certificate, retained for old notes and callers.
+
+    New code should use :func:`encode_cs1_with_amount`.
+    """
     return _encode_fixed("cs", signature, 65)
 
 
@@ -97,6 +99,94 @@ def decode_cs1(value: str) -> bytes | None:
 
 def is_cs1(value: str) -> bool:
     return decode_cs1(value) is not None
+
+
+@dataclass(frozen=True)
+class Cs1:
+    """A current amount-bearing mint certificate."""
+
+    amount_msat: int
+    signature: bytes
+
+
+def _encode_cs1_amount_suffix(amount_msat: int) -> str:
+    for suffix, unit in (
+        ("", 100_000_000_000),
+        ("m", 100_000_000),
+        ("u", 100_000),
+        ("n", 100),
+    ):
+        if amount_msat % unit == 0:
+            return f"{amount_msat // unit}{suffix}"
+    # One pico-BTC is 0.1 msat. Every whole msat is exactly ten pico-BTC.
+    return f"{amount_msat * 10}p"
+
+
+def _decode_cs1_amount_suffix(value: str) -> int | None:
+    if not value:
+        return None
+    unit = value[-1] if value[-1] in "munp" else ""
+    digits = value[:-1] if unit else value
+    if not digits or not digits.isascii() or not digits.isdigit():
+        return None
+    number = int(digits)
+    if unit == "":
+        return number * 100_000_000_000
+    if unit == "m":
+        return number * 100_000_000
+    if unit == "u":
+        return number * 100_000
+    if unit == "n":
+        return number * 100
+    if number % 10:
+        return None
+    return number // 10
+
+
+def encode_cs1_with_amount(amount_msat: int, signature: bytes) -> str:
+    """Encode a current certificate whose prefix carries ``amount_msat``
+    using BOLT 11 amount suffix rules.
+
+    The payload is the mint's recoverable signature over that same amount and
+    the note key. Encoding does not sign or verify it.
+    """
+    if isinstance(amount_msat, bool) or not isinstance(amount_msat, int) or amount_msat < 0:
+        raise ProtocolError("amount_msat must be a non-negative integer")
+    return _encode_fixed("cs" + _encode_cs1_amount_suffix(amount_msat), signature, 65)
+
+
+def decode_cs1_with_amount(value: str) -> Cs1 | None:
+    """Decode a current certificate and the amount carried by its prefix.
+
+    The legacy fixed ``cs`` prefix returns ``None`` because it carries no
+    amount.
+    """
+    if not isinstance(value, str):
+        return None
+    decoded = bech32.decode(value.strip(), constant=bech32.BECH32M)
+    if decoded is None:
+        return None
+    prefix, payload = decoded
+    if not prefix.startswith("cs") or len(payload) != 65:
+        return None
+    amount_msat = _decode_cs1_amount_suffix(prefix[2:])
+    if amount_msat is None:
+        return None
+    return Cs1(amount_msat, payload)
+
+
+def is_cs1_with_amount(value: str) -> bool:
+    return decode_cs1_with_amount(value) is not None
+
+
+def decode_any_cs1(value: str) -> bytes | None:
+    """Return the signature from either a current or legacy certificate."""
+    current = decode_cs1_with_amount(value)
+    return current.signature if current is not None else decode_cs1(value)
+
+
+def is_any_cs1(value: str) -> bool:
+    return decode_any_cs1(value) is not None
 
 
 @dataclass(frozen=True)

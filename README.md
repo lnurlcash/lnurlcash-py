@@ -39,11 +39,10 @@ print(info.max_withdrawable, "msat")
 
 fresh = client.rotate_note(info.callback, info.k1)   # that GET exposed the secret
 
-# A plain note comes back unsigned: LUD-25 Part 2 certifies cp1 notes only,
-# and a hash has nothing to attest to without disclosing the secret. To hold
-# something a recipient can check offline, rotate into a cp1 key (see Part 2
-# below) and verify its cs1 against info.mint_pubkey.
-if fresh.signature is not None:            # a mint still signing Part 1 notes
+# A reference mint returns a raw Part 1 signature when it has a signer, and
+# may omit it in no-signer mode. For an amount-bearing certificate, rotate
+# into a cp1 key (see Part 2 below).
+if fresh.signature is not None:
     verify_note_signature(fresh.k1, info.max_withdrawable, fresh.signature, info.mint_pubkey)
 ```
 
@@ -134,21 +133,21 @@ set, `h`, `h2` and `amount`.
 deliberate retry it counts is a different thing from an invisible one it does
 not. If you pass your own client, do not configure a retrying transport.
 
-**3b. A `cp1` note is owed its certificate; a plain note is unsigned.** LUD-25
-Part 2 certifies `cp1` notes only. A rotate, split or merge to a `cp1` output
+**3b. Legacy hashes and `cp1` outputs use different proof formats.** A rotate,
+split or merge to a `cp1` output
 that the service confirms without its `cs1` (in `sig`, or `sig2` for a split's
 change) raises `UnverifiableNote`, whatever the policy says. A mutation to a
-plain hash output has nothing to attest to without disclosing the secret, so
-it comes back with `signature` set to `None`, and that is the spec, not a fault.
+legacy hash output carries the reference mint's raw Part 1 signature when a
+signer is available and may have `signature=None` in no-signer mode.
 
 `UnverifiableNote` **carries the fresh secrets** the library generated,
 because the mutation landed and the note it minted is real. Read them with
 `new_secrets_of` and persist them before anything else. It is empty after a
 `*_with_hash` call, whose caller named the output and already holds its key.
 
-Two `Policy` fields tune the rest. `require_signatures=True` demands the old
-Part 1 signature over a hash output too, as mints issued before the Part 2
-rewrite. `require_mint_pubkey` (default `True`) makes `fetch_note_info` raise
+Two `Policy` fields tune the rest. `require_signatures=True` demands the raw
+Part 1 signature over a hash output, matching the committed reference wallet.
+`require_mint_pubkey` (default `True`) makes `fetch_note_info` raise
 `ProtocolError` for a `withdrawRequest` publishing no valid `mintPubkey`; set
 it `False` for a Part 1-only mint that publishes none.
 
@@ -215,9 +214,10 @@ under.
 A Part 2 note swaps the hash for a key pair. The wallet keeps `sk`. The mint
 only ever sees `pk`, written `cp1…`. To spend the note you hand over `ck1…`, a
 recoverable signature by `sk` over the fixed message `LNURLcash`, and the mint
-recovers `pk` from it to find the note. The mint's certificate, `cs1…`, is the
-same signature mints already make, over `hex(pk)` instead of a hash. So a
-recipient can check a note offline with nothing but `ck1` and `cs1`.
+recovers `pk` from it to find the note. The mint's certificate, `cs1…`, carries
+the note amount in its prefix using BOLT 11 amount rules and contains the
+signature over `LNURLcash:<amount_msat>:<hex(pk)>`, so a recipient can recover
+the claimed amount and check the note offline.
 
 The protocol calls take both kinds. A `ck1` goes anywhere a `k1` does: a note
 URL, `fetch_note_info`, rotate, split, merge and melt. A `cp1` goes anywhere an
@@ -231,8 +231,9 @@ either kind under, and `note_lookup_of(k1)` what to pass
 ```python
 from lnurlcash_kit import (
     cash_node_to_cx1, derive_cash_address_node, derive_cash_root,
-    derive_note_pubkey, derive_note_secret_key, encode_ck1, encode_cp1,
-    encode_cx1, sign_note_ownership, verify_note_signature,
+    decode_cs1_with_amount, derive_note_pubkey, derive_note_secret_key,
+    encode_ck1, encode_cp1, encode_cx1, sign_note_ownership,
+    verify_note_signature,
 )
 
 node = derive_cash_address_node(derive_cash_root(seed), "mint.example")
@@ -245,7 +246,21 @@ ck1 = encode_ck1(sign_note_ownership(sk))                            # the beare
 
 client.rotate_note_with_hash(callback, ck1, encode_cp1(next_pk))     # sent as p1; its cs1 is owed
 verify_note_signature(ck1, amount_msat, cs1, mint_pubkey)            # offline
+certificate = decode_cs1_with_amount(cs1)                            # amount + signature
 ```
+
+`encode_cs1_with_amount`, `decode_cs1_with_amount` and
+`is_cs1_with_amount` are the current wire API. The fixed-prefix `encode_cs1`,
+`decode_cs1` and `is_cs1` remain for legacy notes; `decode_any_cs1` and
+`is_any_cs1` accept either form during migration. Verification accepts both,
+matching the reference kit; decode the certificate separately if the
+application needs to compare its carried amount with another value.
+
+Reference-mint address management proves control with the address branch's
+index-0 private key. `sign_address_proof(sk0, action, username)` returns the
+raw `r || s || recovery-id` proof over `LNURLcash:<action>:<username>`; action
+is `register` or `unregister`, and the username must be normalised exactly as
+it is sent to the service.
 
 Three things worth knowing:
 

@@ -24,14 +24,37 @@ from __future__ import annotations
 
 from hashlib import sha256
 
-from coincurve import PublicKey
+from coincurve import PrivateKey, PublicKey
 
 from .errors import ProtocolError
-from .recoverable import decode_cs1, note_id_of
+from .recoverable import decode_any_cs1, note_id_of
 from .secrets import is_preimage
 
 _LIGHTNING_SIGNED_MESSAGE_PREFIX = b"Lightning Signed Message:"
 _DOMAIN_TAG = "LNURLcash"
+
+
+def address_proof_digest(action: str, username: str) -> bytes:
+    """Return the digest used to prove control of an address branch's
+    index-0 key. ``username`` must be the normalised value sent to the
+    SERVICE."""
+    if action not in ("register", "unregister"):
+        raise ProtocolError("an address proof action is register or unregister")
+    message = f"{_DOMAIN_TAG}:{action}:{username}".encode()
+    return sha256(sha256(_LIGHTNING_SIGNED_MESSAGE_PREFIX + message).digest()).digest()
+
+
+def sign_address_proof(index_zero_secret_key: bytes, action: str, username: str) -> bytes:
+    """Sign a register/update or unregister proof as raw
+    ``r || s || recovery-id`` bytes."""
+    key = bytes(index_zero_secret_key)
+    if len(key) != 32:
+        raise ProtocolError("an index-zero secret key is 32 bytes")
+    try:
+        signer = PrivateKey(key)
+    except ValueError as err:
+        raise ProtocolError("an index-zero secret key is a scalar in [1, n)") from err
+    return signer.sign_recoverable(address_proof_digest(action, username), hasher=None)
 
 
 def _require_note_id(k1: str) -> str:
@@ -69,8 +92,10 @@ def verify_note_signature(
     """Recover the signer's pubkey and check it against ``mint_pubkey_hex``.
 
     ``k1`` may be a Part 1 secret or a Part 2 ck1, and ``signature_hex`` 65
-    bytes of hex or a cs1. A ck1's note id is recovered locally, so checking a
-    Part 2 note needs no network either.
+    bytes of hex, a current amount-bearing cs1, or a legacy fixed-prefix cs1.
+    Callers can decode the carried amount separately when they need it. A
+    ck1's note id is recovered locally, so checking a Part 2 note needs no
+    network either.
 
     The signature is 65 bytes, but which end carries the recovery id varies by
     implementation: LUD-25 calls for ``r || s || recovery_id``, the layout raw
@@ -105,8 +130,7 @@ def verify_note_signature_hash(
         return False
     if not isinstance(signature_hex, str) or not isinstance(mint_pubkey_hex, str):
         return False
-    # a Part 2 note's certificate arrives as cs1, the same 65 bytes encoded
-    signature = decode_cs1(signature_hex)
+    signature = decode_any_cs1(signature_hex)
     if signature is None:
         try:
             signature = bytes.fromhex(signature_hex)

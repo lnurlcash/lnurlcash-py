@@ -60,10 +60,11 @@ nothing.
 
 **A service that inflates a note.** Where a note is signed, the signature
 commits to the amount. A service reporting more than it signed fails
-verification, without the holder contacting anyone. Since LUD-25 Part 2 that
-means a `cp1` note, whose `cs1` this library always demands, or a hash note
-from a mint still issuing the Part 1 signature. A plain hash note is unsigned
-by design and has no such check.
+verification, without the holder contacting anyone. That means a `cp1` note,
+whose `cs1` this library always demands, or a hash note carrying the raw Part 1
+signature returned by the reference mint when it has a signer. The tolerant
+default also admits a legacy hash output from a no-signer mint; that particular
+note has no offline amount check.
 
 **A service that swaps your note.** The informational GET checks that the
 echoed `k1` is the one queried. A different one means either a non-compliant

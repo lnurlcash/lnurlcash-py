@@ -52,15 +52,16 @@ returns Request(url, parse, new_secrets) and performs no I/O.
    may already have minted.
 4. RequestRefused means nothing was sent - safe to treat as a no-op.
 5. A melt's OK means IN FLIGHT, not spent. NotePending means retry, not spent.
-5b. A cp1 note is owed its certificate; a plain note is UNSIGNED. LUD-25 Part
-   2 certifies cp1 outputs only: a rotate/split/merge to a cp1 output (p1, or
+5b. Legacy hashes and cp1 outputs use different proofs. A rotate/split/merge
+   to a cp1 output (p1, or
    p2 for a split's change) MUST return its cs1 in sig (sig2 for the change),
    and a missing one raises UnverifiableNote WHATEVER the policy says. A hash
-   output comes back with signature None by design; that is not an error.
+   legacy hash uses the raw Part 1 signature when available; the tolerant
+   default admits signature None in no-signer mode.
    UnverifiableNote means the mutation LANDED, so keep its secrets (empty
    after a *_with_hash call: the caller already holds that key).
-   Policy(require_signatures=True) also demands the old Part 1 signature over
-   a hash. Policy(require_mint_pubkey=True), the default, refuses a
+   Policy(require_signatures=True) demands the raw Part 1 signature over a
+   hash, matching the committed reference wallet. Policy(require_mint_pubkey=True), the default, refuses a
    withdrawRequest with no valid mintPubkey; set False for a Part 1-only mint.
 5c. A retried rotate/split/merge MUST be answered by the service as a replay of
    the original success, so a client re-sends one whose answer was lost
@@ -121,9 +122,14 @@ ck1: a recoverable signature by sk over "LNURLcash". cs1 is the mint's
 certificate, cx1 a watch-only branch (x-only pubkey || chain code). All four
 are bech32m, fixed length, no 90-char limit, upper case fine, mixed case
 refused. Decoders return None, never raise.
-encode_cp1/ck1/cs1(bytes) -> str   decode_cp1/ck1/cs1(str) -> bytes | None
+encode_cp1/ck1(bytes) -> str       decode_cp1/ck1(str) -> bytes | None
+encode_cs1_with_amount(amount_msat, sig) / decode_cs1_with_amount -> Cs1
+  CURRENT: HRP is "cs" plus the BOLT11 amount suffix; signature covers
+  LNURLcash:<amount_msat>:<hex(pk)>.
+encode_cs1/decode_cs1/is_cs1 are LEGACY fixed-HRP only.
+decode_any_cs1/is_any_cs1 accept either certificate during migration.
 encode_cx1(pubkey_x_only, chain_code) / decode_cx1(str) -> Cx1 | None
-is_cp1 / is_ck1 / is_cs1 / is_cx1(str) -> bool
+is_cp1 / is_ck1 / is_cs1_with_amount / is_cx1(str) -> bool
 derive_cash_address_node(root, host) -> CashNode   m/139'/1'/d1/d2/d3/d4,
   d1..d4 = HMAC-SHA256(privkey at m/139'/1'/0, host), raw as in Part 1. The
   REFERENCE WALLET'S path. The spec text's m/139'/d1..d4 is the Part 1
@@ -135,6 +141,9 @@ derive_note_pubkey(branch_pubkey_x_only, chain_code, i) -> 32-byte x-only
   ProtocolError: use the next i. Never reduced.
 derive_note_secret_key(branch_private_key, chain_code, i) -> 32 bytes
 sign_note_ownership(sk) -> 65 bytes r || s || recid, RFC6979, low-S
+address_proof_digest(action, username) / sign_address_proof(index_zero_sk, action, username)
+  reference register/update/unregister proof; exact message
+  LNURLcash:<register|unregister>:<normalised username>; raw r||s||recid
 recover_note_ownership_pubkey(sig) -> x-only pk | None
 note_id_of(k1) -> sha256 hex for a hex k1, recovered pk hex for a ck1, else None
   One note has MANY valid ck1 strings. Compare notes by this, never by k1.
