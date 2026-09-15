@@ -1,0 +1,124 @@
+name: release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Prospective release tag, for example v0.1.0
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-lnurlcash-py-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: startsWith(inputs.tag || github.ref_name, 'v')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify release commit and version
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor HEAD refs/remotes/origin/main || {
+            echo "::error::Release tags must point to a commit on origin/main"
+            exit 1
+          }
+          package_version="$(python - <<'PY'
+          import tomllib
+          with open('pyproject.toml', 'rb') as source:
+              print(tomllib.load(source)['project']['version'])
+          PY
+          )"
+          test "$RELEASE_TAG" = "v$package_version" || {
+            echo "::error::Expected tag v$package_version, got $RELEASE_TAG"
+            exit 1
+          }
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.13'
+
+      - name: Set up Node for the adversarial mint
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Checkout the pinned conformance suite
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: lnurlcash/lnurlcash-conformance
+          ref: v0.11.0
+          path: conformance
+          persist-credentials: false
+
+      - name: Install test and build dependencies
+        run: |
+          python -m pip install --upgrade build twine
+          python -m pip install -e '.[dev]'
+          npm ci --prefix conformance
+
+      - name: Test against the pinned conformance suite
+        run: pytest -q
+        env:
+          LNURLCASH_CONFORMANCE: ${{ github.workspace }}/conformance
+
+      - name: Build and inspect distributions
+        run: |
+          python -m build
+          python -m twine check dist/*
+
+      - name: Smoke-test the built wheel
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          python -m venv "$RUNNER_TEMP/package-smoke"
+          "$RUNNER_TEMP/package-smoke/bin/pip" install dist/*.whl
+          "$RUNNER_TEMP/package-smoke/bin/python" - <<'PY'
+          import os
+          import lnurlcash_kit
+          assert lnurlcash_kit.__version__ == os.environ['RELEASE_TAG'].removeprefix('v')
+          assert callable(lnurlcash_kit.LnurlcashClient)
+          assert callable(lnurlcash_kit.encode_cs1_with_amount)
+          PY
+
+      - name: Upload exact distributions
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: pypi-distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download validated distributions
+        uses: actions/download-artifact@70fc10c6e5e1ce46ad2ea6f2b72d43f7d47b13c3 # v8.0.0
+        with:
+          name: pypi-distributions
+          path: dist/
+
+      - name: Publish to PyPI with trusted publishing
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1 2026-09-15
