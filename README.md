@@ -108,8 +108,8 @@ first attempt burns the input. For most of this draft's life that was the
 sharpest edge in the protocol: a stack that resent a dropped GET got "already
 spent" for the second attempt, which reads as a *definitive* rejection, so the
 fresh secret got discarded along with the note the service had just minted. The
-hazard broke the [Kotlin](https://github.com/TheCryptoDonkey/lnurlcash-kotlin)
-and [Go](https://github.com/TheCryptoDonkey/lnurlcash-go) siblings during
+hazard broke the [Kotlin](https://github.com/lnurlcash/lnurlcash-kotlin)
+and [Go](https://github.com/lnurlcash/lnurlcash-go) siblings during
 development, by two different mechanisms.
 
 LUD-25 closed it. A service MUST answer a byte-identical rotate, split or merge
@@ -330,13 +330,13 @@ The reference implementations, both dni's, both MIT:
 
 This library is a Python implementation of the same protocol, following that
 wallet's protocol layer and checked against the same
-[conformance vectors](https://github.com/TheCryptoDonkey/lnurlcash-conformance)
+[conformance vectors](https://github.com/lnurlcash/lnurlcash-conformance)
 as its TypeScript, Rust and Go siblings — and against the same adversarial
 mock mint, which can be told to drop a connection mid-mutation, sign in the
 wrong byte order, lie about a note's value, or never settle a melt.
 
 The wider ecosystem — wallets, mints, hardware and hosted services — is
-indexed in [awesome-lnurlcash](https://github.com/TheCryptoDonkey/awesome-lnurlcash).
+indexed in [awesome-lnurlcash](https://github.com/lnurlcash/awesome-lnurlcash).
 
 ## Development
 
