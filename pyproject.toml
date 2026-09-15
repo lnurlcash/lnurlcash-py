@@ -35,10 +35,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/TheCryptoDonkey/lnurlcash-py"
-Source = "https://github.com/TheCryptoDonkey/lnurlcash-py"
-Issues = "https://github.com/TheCryptoDonkey/lnurlcash-py/issues"
-Changelog = "https://github.com/TheCryptoDonkey/lnurlcash-py/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/lnurlcash/lnurlcash-py"
+Source = "https://github.com/lnurlcash/lnurlcash-py"
+Issues = "https://github.com/lnurlcash/lnurlcash-py/issues"
+Changelog = "https://github.com/lnurlcash/lnurlcash-py/blob/main/CHANGELOG.md"
 Specification = "https://github.com/lnurl/luds/pull/301"
 
 [tool.hatch.build.targets.wheel]
