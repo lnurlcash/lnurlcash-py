@@ -23,6 +23,7 @@ from lnurlcash_kit.protocol import (
 from lnurlcash_kit import (
     NOSTR_CASH_SEED_LABEL,
     AmbiguousMint,
+    Cs1,
     Cx1,
     LnurlcashClient,
     LnurlcashError,
@@ -32,14 +33,17 @@ from lnurlcash_kit import (
     NoteUnknown,
     ServiceRejected,
     UnverifiableNote,
+    address_proof_digest,
     cash_domain_indices,
     cash_node_from_hex,
     cash_node_to_cx1,
     cash_node_to_hex,
     cash_secret_at,
+    decode_any_cs1,
     decode_ck1,
     decode_cp1,
     decode_cs1,
+    decode_cs1_with_amount,
     decode_cx1,
     derive_cash_address_node,
     derive_cash_child,
@@ -55,10 +59,13 @@ from lnurlcash_kit import (
     encode_ck1,
     encode_cp1,
     encode_cs1,
+    encode_cs1_with_amount,
     encode_cx1,
+    is_any_cs1,
     is_ck1,
     is_cp1,
     is_cs1,
+    is_cs1_with_amount,
     is_cx1,
     note_id_of,
     note_lookup_of,
@@ -66,6 +73,7 @@ from lnurlcash_kit import (
     note_signature_message_for_hash,
     recover_note_ownership_pubkey,
     sign_note_ownership,
+    sign_address_proof,
     verify_note_signature_hash,
     hash_k1,
     ProtocolError,
@@ -217,8 +225,8 @@ def test_response_classification(case, via):
         result = _drive(case, via)
         if via == "melt":
             return
-        # Absent means none. A plain note is unsigned, so its signature is
-        # None rather than something this suite merely declined to check.
+        # Absent means none: the response fixture models no-signer mode rather
+        # than something this suite merely declined to check.
         assert result.signature == case.get("signature")
         if via == "split":
             assert result.change_signature == case.get("changeSignature")
@@ -654,10 +662,19 @@ _CURVE_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 _PART2_DECODERS = {
     "cp1": decode_cp1,
     "ck1": decode_ck1,
-    "cs1": decode_cs1,
+    "cs1": lambda value: (
+        certificate.signature
+        if (certificate := decode_cs1_with_amount(value)) is not None
+        else None
+    ),
     "cx1": decode_cx1,
 }
-_PART2_TESTS = {"cp1": is_cp1, "ck1": is_ck1, "cs1": is_cs1, "cx1": is_cx1}
+_PART2_TESTS = {
+    "cp1": is_cp1,
+    "ck1": is_ck1,
+    "cs1": is_cs1_with_amount,
+    "cx1": is_cx1,
+}
 
 
 def _bip39_seed(mnemonic: str) -> bytes:
@@ -687,11 +704,30 @@ def test_part2_conventions_are_the_ones_this_library_implements():
     assert conventions["addressBranch"] == "m/139'/1'/d1/d2/d3/d4"
     assert conventions["hashingKey"] == "m/139'/1'/0"
     assert conventions["ownershipMessage"] == "LNURLcash"
+    assert conventions["addressProofMessage"] == "LNURLcash:<register|unregister>:<username>"
     assert conventions["certificateMessage"] == "LNURLcash:<amount_msat>:<hex(pk)>"
+    assert conventions["certificateHrp"] == "cs || BOLT11_amount_suffix(amount_msat)"
     assert conventions["signatureLayout"].startswith("r || s || recovery id")
     assert conventions["indexWidth"].startswith("4 bytes, big-endian")
     # the digest itself is bound in test_part2_note, by recovering the
     # library's own signatures against it
+
+
+@pytest.mark.parametrize(
+    "proof", _cases(_PART2, "addressProofs"), ids=lambda p: f"{p['action']}/{p['username']}"
+)
+def test_address_proof(proof):
+    digest = address_proof_digest(proof["action"], proof["username"])
+    assert digest.hex() == proof["digest"]
+    signature = sign_address_proof(
+        bytes.fromhex(proof["indexZeroSecretKey"]), proof["action"], proof["username"]
+    )
+    assert signature.hex() == proof["signature"]
+
+
+def test_address_proof_rejects_unknown_action():
+    with pytest.raises(ProtocolError):
+        address_proof_digest("delete", "alice")
 
 
 def test_part2_covers_both_branch_parities_and_the_whole_index_range():
@@ -794,8 +830,20 @@ def test_part2_certificate(cert):
     signature = bytes.fromhex(cert["signature"])
     # the mint's side is as deterministic as the holder's
     assert mint_key.sign_recoverable(digest, hasher=None) == signature
-    assert encode_cs1(signature) == cert["cs1"]
-    assert decode_cs1(cert["cs1"]) == signature
+    assert encode_cs1_with_amount(amount, signature) == cert["cs1"]
+    assert decode_cs1_with_amount(cert["cs1"]) == Cs1(amount, signature)
+    assert is_cs1_with_amount(cert["cs1"])
+    assert not is_cs1(cert["cs1"])
+    assert decode_any_cs1(cert["cs1"]) == signature
+    assert is_any_cs1(cert["cs1"])
+
+    legacy = encode_cs1(signature)
+    assert decode_cs1(legacy) == signature
+    assert is_cs1(legacy)
+    assert decode_cs1_with_amount(legacy) is None
+    assert not is_cs1_with_amount(legacy)
+    assert decode_any_cs1(legacy) == signature
+    assert is_any_cs1(legacy)
     recovered = PublicKey.from_signature_and_message(signature, digest, hasher=None)
     assert recovered.format(compressed=True).hex() == mint["mintPubkey"]
 

@@ -195,7 +195,7 @@ def test_rotate_burns_the_old_secret_and_mints_one_the_service_never_saw(mint, c
 
 
 def test_rotate_signature_verifies_offline(mint, client):
-    # A mint still issuing the old Part 1 signature over a plain note is fine:
+    # The reference mint's raw Part 1 signature over a legacy note is kept:
     # the default neither demands it nor drops it.
     m = mint()
     k1 = secret()
@@ -217,11 +217,9 @@ def test_accepts_the_other_recovery_id_layout(mint, client):
     assert verify_note_signature(rotated.k1, 21000, rotated.signature, m.pubkey)
 
 
-def test_an_unsigned_rotate_to_a_plain_note_is_the_spec(mint, client):
-    """LUD-25 Part 2 certifies cp1 notes only: a hash has nothing to attest to
-    without disclosing the secret. So a mint answering a plain rotate with a
-    bare OK is following the spec, and the note comes back with no signature,
-    which is exactly what it is."""
+def test_a_no_signer_legacy_mint_is_tolerated_by_default(mint, client):
+    """The tolerant default preserves a landed legacy output when the
+    reference mint has no signer; strict reference-wallet parity is separate."""
     m = mint(signatures=False)
     k1 = secret()
     m.credit(k1, 21000)
@@ -232,7 +230,7 @@ def test_an_unsigned_rotate_to_a_plain_note_is_the_spec(mint, client):
     assert m.note_state(rotated.k1) == "outstanding"
 
 
-def test_an_unsigned_split_and_merge_to_plain_notes_are_the_spec(mint, client):
+def test_no_signer_split_and_merge_outputs_are_tolerated(mint, client):
     m = mint(signatures=False)
     k1 = secret()
     m.credit(k1, 21000)
@@ -247,8 +245,8 @@ def test_an_unsigned_split_and_merge_to_plain_notes_are_the_spec(mint, client):
 
 
 def test_require_signatures_still_refuses_an_unsigned_plain_note(mint):
-    """A caller who still wants the old Part 1 signature over the hash can ask
-    for it.
+    """A caller matching the committed reference wallet can demand the raw
+    Part 1 signature over the hash.
 
     The refusal has to be the loud kind - but the rotate LANDED, and the fresh
     secret is the only key to the note it minted, so the exception carries it

@@ -62,14 +62,13 @@ class Policy:
     ``cp1`` output MUST come back with its ``cs1`` certificate in ``sig``
     (``sig2`` for a split's change), and this library always insists on that:
     nothing here turns it off, because a ``cp1`` note nobody can check offline
-    is missing the one thing it is for. A plain hash output has nothing a
-    SERVICE can attest to without disclosing the secret, so it comes back
-    unsigned by design, with ``signature`` None.
+    is missing the one thing it is for. A legacy hash output carries the raw
+    Part 1 signature when the reference mint has a signer and may be unsigned
+    in its no-signer mode.
 
-    ``require_signatures`` also demands the old Part 1 signature over a hash
-    output, as every mint issued before the Part 2 rewrite. Off by default: a
-    SERVICE following the current draft answers a plain rotate with a bare
-    ``{"status":"OK"}``, and refusing that would be refusing the spec.
+    ``require_signatures`` demands the raw Part 1 signature over a legacy hash
+    output, matching the committed reference wallet. It is off by default to
+    admit the reference mint's no-signer mode.
 
     ``require_mint_pubkey`` refuses a ``withdrawRequest`` that publishes no
     valid ``mintPubkey``, the key a ``cp1`` note's certificate verifies
@@ -577,10 +576,9 @@ def _require_signature(
     ``output`` is the ``h``/``p1`` (or ``h2``/``p2``) the mutation named. A
     ``cp1`` output is owed its ``cs1`` certificate: LUD-25 Part 2 requires one,
     and it is the whole reason to hold a ``cp1`` note, so no policy waives it.
-    A plain hash output has nothing a SERVICE can attest to without disclosing
-    the secret, so it is unsigned by design, and is only refused for coming
-    back unsigned when ``require_signatures`` asks for the old Part 1
-    signature. A signature that is present is passed on as sent either way,
+    A legacy hash output carries the raw Part 1 signature when available, and
+    is refused without it only when ``require_signatures`` enables strict
+    reference-wallet parity. A signature that is present is passed on as sent,
     never checked here: :func:`~lnurlcash_kit.signature.verify_note_signature`
     is the check.
 
@@ -665,9 +663,8 @@ def rotate_request_with_hash(
 
     A ``cp1`` output that comes back without its ``cs1`` raises
     :class:`~lnurlcash_kit.errors.UnverifiableNote` whatever the policy says.
-    A hash output that comes back unsigned is a plain note and returns
-    ``signature`` None, unless the policy's ``require_signatures`` asks for
-    the old Part 1 signature over it.
+    A legacy hash output returns ``signature`` None only in no-signer mode,
+    unless the policy's ``require_signatures`` demands the raw Part 1 proof.
     """
     url = _callback(callback, [("k1", k1), _output_param(h, 1)])
 

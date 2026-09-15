@@ -18,6 +18,7 @@ from coincurve import PrivateKey
 
 from conftest import load_vectors
 from lnurlcash_kit import (
+    Cs1,
     LnurlcashClient,
     Policy,
     ProtocolError,
@@ -25,9 +26,11 @@ from lnurlcash_kit import (
     UnverifiableNote,
     build_note_info_url_by_hash,
     cash_node_from_hex,
+    decode_any_cs1,
     decode_ck1,
     decode_cp1,
     decode_cs1,
+    decode_cs1_with_amount,
     decode_cx1,
     derive_cash_child,
     derive_cash_master,
@@ -37,11 +40,12 @@ from lnurlcash_kit import (
     derive_nostr_cash_seed,
     encode_ck1,
     encode_cp1,
+    encode_cs1_with_amount,
     encode_cx1,
     hash_k1,
     is_ck1,
     is_cp1,
-    is_cs1,
+    is_cs1_with_amount,
     is_cx1,
     new_secrets_of,
     note_id_of,
@@ -256,8 +260,8 @@ def test_one_merge_takes_a_part1_secret_and_a_part2_note(notes):
 
 # What each output is owed. A cp1 note is owed its cs1 whatever the policy
 # says, because without one it cannot be checked offline, which is the whole
-# reason to hold one. A hash output is a plain note and is owed nothing unless
-# the caller asks for the old Part 1 signature.
+# reason to hold one. A legacy hash uses the raw Part 1 signature when
+# available; the caller decides whether no-signer omission is accepted.
 
 _EVERY_POLICY = [
     None,
@@ -392,7 +396,7 @@ def test_anything_else_is_refused_before_an_invoice_is_asked_for(notes, cert):
 
 def test_the_four_types_never_pass_for_one_another(part2, notes, cert):
     a, cx1 = notes[0], part2["branches"][0]["cx1"]
-    checks = (is_cp1, is_ck1, is_cs1, is_cx1)
+    checks = (is_cp1, is_ck1, is_cs1_with_amount, is_cx1)
     assert [check(a["cp1"]) for check in checks] == [True, False, False, False]
     assert [check(a["ck1"]) for check in checks] == [False, True, False, False]
     assert [check(cert["cs1"]) for check in checks] == [False, False, True, False]
@@ -437,7 +441,14 @@ def test_non_zero_padding_is_refused(notes):
 
 def test_decoders_return_none_rather_than_raise():
     for bad in [None, 42, b"cp1", "", "cp1", "1", "cp1éééééé", "cp1 x"]:
-        for decode in (decode_cp1, decode_ck1, decode_cs1, decode_cx1):
+        for decode in (
+            decode_cp1,
+            decode_ck1,
+            decode_cs1,
+            decode_cs1_with_amount,
+            decode_any_cs1,
+            decode_cx1,
+        ):
             assert decode(bad) is None
 
 
@@ -447,7 +458,22 @@ def test_encoders_refuse_a_payload_of_the_wrong_length():
     with pytest.raises(ProtocolError):
         encode_ck1(bytes(64))
     with pytest.raises(ProtocolError):
+        encode_cs1_with_amount(1, bytes(64))
+    with pytest.raises(ProtocolError):
         encode_cx1(bytes(32), bytes(31))
+
+
+@pytest.mark.parametrize("amount", [0, 1, 99, 100, 21_000, 2**63 - 1])
+def test_amount_bearing_cs1_boundaries(amount):
+    signature = bytes(65)
+    encoded = encode_cs1_with_amount(amount, signature)
+    assert decode_cs1_with_amount(encoded) == Cs1(amount, signature)
+
+
+@pytest.mark.parametrize("amount", [-1, 1.0, True, None])
+def test_amount_bearing_cs1_requires_a_non_negative_integer(amount):
+    with pytest.raises(ProtocolError):
+        encode_cs1_with_amount(amount, bytes(65))
 
 
 def test_lnurl_decoding_is_untouched_by_bech32m():

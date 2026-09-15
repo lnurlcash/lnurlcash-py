@@ -97,9 +97,8 @@ class UnverifiableNote(LnurlcashError):
     Raised for a ``cp1`` output that came back without its ``cs1``
     certificate, which LUD-25 Part 2 requires whatever the policy says - a
     non-compliant SERVICE. And for a hash output that came back unsigned when
-    the policy's ``require_signatures`` asked for the old Part 1 signature.
-    Otherwise a hash output coming back unsigned is the spec, and raises
-    nothing.
+    the policy's ``require_signatures`` asked for the raw Part 1 signature.
+    The tolerant default instead admits the reference mint's no-signer mode.
 
     Either way the mutation LANDED. The note exists, at the key or hash the
     caller disclosed, and the secret behind it is the only key to that value

@@ -5,7 +5,7 @@ from __future__ import annotations
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from .errors import ProtocolError
-from .recoverable import is_cp1, note_id_of
+from .recoverable import decode_cs1_with_amount, is_cp1, is_cs1_with_amount, note_id_of
 from .secrets import is_preimage
 from .urls import from_lud17, resolve_lnurl_input
 
@@ -54,13 +54,17 @@ def note_declared_amount(url: str) -> int | None:
     """What a note CLAIMS to carry. Only a claim by whoever encoded it - a
     SERVICE ignores it at the informational endpoint - so it is safe to display
     before contacting the SERVICE but must not be trusted without either a
-    matching signature or a fresh online GET."""
+    matching signature or a fresh online GET. When there is no separate
+    ``amount``, a current amount-bearing ``cs1`` carries the same declaration
+    in its prefix."""
     try:
         raw = _first(url, "amount")
     except ValueError:
         return None
     if raw is None:
-        return None
+        signature = _first(url, "sig")
+        certificate = decode_cs1_with_amount(signature) if signature else None
+        return certificate.amount_msat if certificate is not None else None
     try:
         return int(raw)
     except ValueError:
@@ -154,6 +158,7 @@ def with_new_k1(
     merge. A signature only carries over when the response actually returned a
     fresh one: a mutation at a SERVICE without offline verification drops any
     stale sig, since it no longer matches the new secret."""
+    amount_is_implied = bool(signature) and is_cs1_with_amount(signature)
     pairs: list[tuple[str, str]] = []
     replaced = {"k1": False, "amount": False, "sig": False}
     for key, value in _query_pairs(url):
@@ -161,8 +166,9 @@ def with_new_k1(
             pairs.append((key, k1.lower()))
             replaced["k1"] = True
         elif key == "amount":
-            pairs.append((key, str(amount_msat)))
-            replaced["amount"] = True
+            if not amount_is_implied:
+                pairs.append((key, str(amount_msat)))
+                replaced["amount"] = True
         elif key == "sig":
             if signature:
                 pairs.append((key, signature))
@@ -171,7 +177,7 @@ def with_new_k1(
             pairs.append((key, value))
     if not replaced["k1"]:
         pairs.append(("k1", k1.lower()))
-    if not replaced["amount"]:
+    if not replaced["amount"] and not amount_is_implied:
         pairs.append(("amount", str(amount_msat)))
     if signature and not replaced["sig"]:
         pairs.append(("sig", signature))
@@ -182,6 +188,7 @@ def without_k1(url: str, amount_msat: int, signature: str | None = None) -> str:
     """Like ``with_new_k1`` but removes k1 - for re-deriving a hardware-backed
     note's blank URL template after a mutation whose fresh secret now lives on
     the device rather than in this process."""
+    amount_is_implied = bool(signature) and is_cs1_with_amount(signature)
     pairs: list[tuple[str, str]] = []
     seen_amount = False
     seen_sig = False
@@ -189,15 +196,16 @@ def without_k1(url: str, amount_msat: int, signature: str | None = None) -> str:
         if key == "k1":
             continue
         if key == "amount":
-            pairs.append((key, str(amount_msat)))
-            seen_amount = True
+            if not amount_is_implied:
+                pairs.append((key, str(amount_msat)))
+                seen_amount = True
         elif key == "sig":
             if signature:
                 pairs.append((key, signature))
                 seen_sig = True
         else:
             pairs.append((key, value))
-    if not seen_amount:
+    if not seen_amount and not amount_is_implied:
         pairs.append(("amount", str(amount_msat)))
     if signature and not seen_sig:
         pairs.append(("sig", signature))

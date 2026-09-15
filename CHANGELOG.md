@@ -5,6 +5,29 @@ carry breaking changes; pin an exact version.
 
 ## 0.1.0 — unreleased
 
+### Reference address proofs and compact note URLs
+
+- Add `address_proof_digest` and `sign_address_proof` for the reference
+  mint's signed register/update/unregister flow, using the address branch's
+  index-0 key and binding the proof to both action and normalised username.
+- Read the declared amount from an amount-bearing `cs1` when no separate
+  `amount` exists, and omit that duplicate parameter when rebuilding a URL
+  carrying a current certificate.
+- Grade both behaviours against `lnurlcash-conformance` 0.11.0 vectors.
+
+### Amount-bearing mint certificates
+
+- Add `encode_cs1_with_amount`, `decode_cs1_with_amount` and
+  `is_cs1_with_amount` for the current wire format, whose prefix carries the
+  amount with BOLT 11 amount rules. Decoding returns the new frozen `Cs1`
+  dataclass.
+- Keep `encode_cs1`, `decode_cs1` and `is_cs1` unchanged for legacy
+  fixed-prefix certificates. Add `decode_any_cs1` and `is_any_cs1` for
+  migrations accepting both forms.
+- Signature verification accepts both formats, matching the reference kit;
+  callers can decode and compare the carried amount separately when needed.
+- Grade the current format against `lnurlcash-conformance` 0.11.0 vectors.
+
 ### Amounts are read exactly
 
 - An informational GET, by secret or by hash, whose `maxWithdrawable` or
@@ -17,18 +40,17 @@ carry breaking changes; pin an exact version.
   case, through the client over a mock transport, including the request it
   sends: `sig` stays behind and `k1` goes out unchanged.
 
-### A plain note is unsigned
+### No-signer legacy compatibility
 
-LUD-25 Part 2 certifies `cp1` notes only: a plain hash has nothing to attest
-to without disclosing the secret. The reference mint and moneyer now answer a
-rotate, split or merge to a hash output with a bare `{"status":"OK"}`, and
-with the old default this library raised `UnverifiableNote` on every plain
-rotate against them. So it follows the spec, as lnurlcash-kit 0.13.0 does.
+The reference mint signs a legacy hash output with a raw Part 1 signature when
+a signer is available and may omit it in no-signer mode. The committed
+TypeScript reference wallet requires it; this library keeps a tolerant default
+and exposes the strict behaviour as policy.
 
-- `Policy.require_signatures` now defaults to **False**. A hash output that
-  comes back unsigned is the spec, not a fault: `signature` (and
-  `change_signature`) is `None`, and nothing is raised. Set it true to keep
-  demanding the old Part 1 signature over the hash.
+- `Policy.require_signatures` now defaults to **False**. In no-signer mode,
+  `signature` (and `change_signature`) is `None` and nothing is raised. Set it
+  true to match the strict reference wallet and demand the raw Part 1
+  signature over the hash.
 - A `cp1` output is owed its `cs1` certificate whatever the policy says. A
   rotate, split or merge naming one (sent as `p1`, or `p2` for a split's
   change) that comes back without `sig` (or `sig2` for a `cp1` change) raises
@@ -145,13 +167,13 @@ and the adversarial mock mint.
 **A `cp1` note is owed its certificate, and this library insists on it.** For
 a while LUD-25 required a signature over every note a rotate, split or merge
 minted, and this library's default refused an unsigned one. The Part 2
-rewrite narrowed that to `cp1` notes, the only kind a SERVICE can certify
-without seeing the secret, so a mutation to a `cp1` output that comes back
-without its `cs1` raises `UnverifiableNote`, and a plain hash output comes
-back unsigned by design. `note_info_request` refuses a `withdrawRequest`
+rewrite introduced `cp1` certificates, so a mutation to a `cp1` output that
+comes back without its `cs1` raises `UnverifiableNote`. A legacy hash carries
+the raw Part 1 signature when a signer is available and may omit it in
+no-signer mode. `note_info_request` refuses a `withdrawRequest`
 publishing no `mintPubkey`, or one that is not a 33-byte compressed secp256k1
 key, unless `Policy(require_mint_pubkey=False)`.
-`Policy(require_signatures=True)` still demands the old signature over a hash.
+`Policy(require_signatures=True)` demands the raw signature over a hash.
 
 That exception carries whatever fresh secrets the library generated, and the
 reason matters: `status` was OK, so the mutation LANDED. The note exists at the

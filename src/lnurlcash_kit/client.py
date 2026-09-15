@@ -66,8 +66,9 @@ class _Base:
         #: for what a caller takes on by doing so.
         self.rng = rng
         #: What this client insists a SERVICE does. The default demands a cs1
-        #: on every cp1 output and a mintPubkey on every withdrawRequest, and
-        #: takes a plain hash note unsigned, as LUD-25 Part 2 has it. See
+        #: on every cp1 output and a mintPubkey on every withdrawRequest. It
+        #: verifies a raw Part 1 signature when present, while tolerating its
+        #: omission by a no-signer legacy mint. See
         #: :class:`~lnurlcash_kit.protocol.Policy`.
         self.policy = policy
         #: How many times to re-send a rotate, split or merge whose outcome the
