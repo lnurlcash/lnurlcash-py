@@ -1,11 +1,11 @@
-"""LUD-25 seed-recoverable note secrets: the specified scheme.
-
-LUD-25's "Seed-recoverable note secrets" section, in full::
+"""LUD-25's ``m/139'`` branch derivation: the BIP-32 walk from a wallet's cash
+root down to a per-SERVICE domain node, exactly as Part 2's "Seed &
+derivation" section specifies it::
 
     cashHashingKey   = derive(masterKey, m/139'/0)
     domainMaterial   = hmacSha256(cashHashingKey, full SERVICE domain)
     (d1, d2, d3, d4) = first 16 bytes of domainMaterial as 4 uint32
-    secret_i         = derive(masterKey, m/139'/d1/d2/d3/d4/i')
+    domainNode       = derive(masterKey, m/139'/d1/d2/d3/d4)
 
 "exactly as LUD-05", says the draft of the middle two lines, and that
 reference settles the one thing the path shape leaves open. ``d1..d4`` are raw
@@ -13,17 +13,23 @@ uint32 drawn from a hash, and BIP-32 already reads any index >= 2^31 as
 hardened, so roughly half of any given mint's four levels are hardened by
 magnitude alone. They are used exactly as they fall: nothing is masked, and
 nothing is forced hardened. That is what LUD-05's own corpus does with the same
-four longs, and what the reference wallet does. Only ``i`` is deliberately
-hardened, by the spec's own ``i'``.
+four longs, and what the reference wallet does.
 
 An implementation that masks the top bit, or hardens all four, derives a
 different tree from every conforming wallet - and a restore against it finds
 nothing, silently, and only once the money is gone.
 
-This is NOT the scheme in :mod:`~lnurlcash_kit.secrets`. That one (HMAC-SHA256
-under ``lnurlcash-note-v1``) predates this section and is now the legacy
-scheme: still derived, still scanned on restore, so nothing already minted goes
-missing, but not what a new wallet should mint under.
+Part 1 secrets are NOT derived from this node, or from the seed at all -
+Part 1's own text has WALLET generate plain randomness. An earlier
+reference-wallet extension did derive Part 1 secrets deterministically from a
+sibling of this branch, hardened at the note's own index; it has since been
+dropped as unspecified, and this module no longer provides it.
+:mod:`~lnurlcash_kit.secrets`' legacy scheme (HMAC-SHA256 under
+``lnurlcash-note-v1``, predating LUD-25 entirely) is still derived and still
+scanned on restore, so nothing already minted under it goes missing.
+
+Part 2's address branch is this exact domain node, for the same host: see
+:func:`~lnurlcash_kit.recoverable.derive_cash_address_node`.
 """
 
 from __future__ import annotations
@@ -125,7 +131,7 @@ def derive_cash_master(seed: bytes) -> CashNode:
 
 
 def derive_cash_root(seed: bytes) -> CashNode:
-    """``m/139'`` - the wallet's own root for note secrets, under its own
+    """``m/139'`` - the wallet's own root for Part 2 note keys, under its own
     purpose so it never shares key material with LUD-05's ``m/138'``
     linking-key branch.
 
@@ -150,18 +156,12 @@ def cash_domain_indices(root: CashNode, host: str) -> tuple[int, int, int, int]:
 
 
 def derive_cash_domain_node(root: CashNode, host: str) -> CashNode:
-    """``m/139'/d1/d2/d3/d4`` for one mint: everything above a note's own index.
+    """``m/139'/d1/d2/d3/d4`` for one mint: the Part 2 address branch
+    (:func:`~lnurlcash_kit.recoverable.derive_cash_address_node` is this node).
 
-    Worth having as its own step, and not only to derive it once for a run of
-    secrets. Every unhardened level in the path is at or above this node, so a
-    signer given THIS rather than the seed needs no elliptic curve at all -
-    each ``i'`` beneath it is HMAC-SHA512 plus one modular addition. That is
-    the difference between a hardware wallet that can do LUD-25 recovery and
-    one that would need secp256k1 added to its firmware for it.
-
-    The cost is that whoever derives it can derive every note secret the wallet
-    will ever hold AT THIS MINT, so it is provisioning material rather than
-    something to hand out: one mint's subtree, not the wallet.
+    Whoever holds it can derive every Part 2 note key the wallet will ever hold
+    AT THIS MINT, so it is provisioning material rather than something to hand
+    out: one mint's subtree, not the wallet. Hand out its cx1 instead.
 
     ``host`` is the mint host exactly as the wallet stores it - lowercase, port
     included where there is one - which is what the reference wallet passes, so
@@ -171,33 +171,6 @@ def derive_cash_domain_node(root: CashNode, host: str) -> CashNode:
     for index in cash_domain_indices(root, host):
         node = derive_cash_child(node, index)
     return node
-
-
-def _require_index(index: int) -> int:
-    if not 0 <= index < _HARDENED:
-        raise ProtocolError(f"a note index must be in [0, 2**31), not {index}")
-    return index
-
-
-def cash_secret_at(domain_node: CashNode, index: int) -> str:
-    """The i-th note secret beneath a mint's domain node, as 32 bytes of hex.
-
-    The size of a payment preimage, so :func:`~lnurlcash_kit.secrets.hash_k1`
-    and every wire path treat it exactly as they treat a randomly drawn one.
-    The SERVICE sees no difference: it only ever receives sha256(k1).
-    """
-    leaf = derive_cash_child(domain_node, _require_index(index) + _HARDENED)
-    return leaf.private_key.hex()
-
-
-def derive_cash_secret(root: CashNode, host: str, index: int) -> str:
-    """The convenience form, from the root.
-
-    Re-derives the domain node on every call, which is up to four point
-    multiplications - fine for one secret, wasteful for a run of them. Use
-    :class:`CashSecretSource` for those.
-    """
-    return cash_secret_at(derive_cash_domain_node(root, host), index)
 
 
 def cash_node_to_hex(node: CashNode) -> str:
@@ -225,47 +198,3 @@ def cash_node_from_hex(value: str) -> CashNode:
     except ValueError as err:
         raise ProtocolError("that cash node holds an invalid private key") from err
     return CashNode(raw[:32], raw[32:])
-
-
-class CashSecretSource:
-    """Walks a mint's indices in order, so a caller can hand it to any mutating
-    call and let rotate, split and merge draw derived secrets without knowing
-    anything about derivation.
-
-    :attr:`next_index` reads back the next unused index afterwards - a split
-    consumes two, a rotate one - which is the number the wallet persists as its
-    counter for that host. The domain node is derived once, here, rather than
-    per secret.
-
-    Persist that counter in the SAME write that stages the new records, and do
-    it BEFORE the hash goes on the wire. A crash between the bump and the
-    request wastes an index, which costs nothing; a crash the other way round
-    re-derives a secret the mint has already seen, and the second note minted
-    at it collides with the first.
-
-    The counter is not secret - an index reveals nothing without the root - so
-    it belongs in an ordinary backup, and a restore should merge counters
-    upwards only. It is also not optional: a gap scan cannot see a burned index
-    (LUD-25 requires a hash lookup to answer for a spent note exactly as it
-    answers for one that never existed), so a wallet that has rotated more
-    times than its gap limit cannot rediscover its own position from the mint.
-    """
-
-    def __init__(self, root: CashNode, host: str, start: int = 0) -> None:
-        self._domain_node = derive_cash_domain_node(root, host)
-        self._next = _require_index(start)
-
-    def __call__(self) -> str:
-        """The next secret, advancing the counter. Shaped to drop straight in
-        wherever a secret generator is accepted."""
-        secret = cash_secret_at(self._domain_node, self._next)
-        self._next += 1
-        return secret
-
-    @property
-    def next_index(self) -> int:
-        """The next unused index - what the wallet persists."""
-        return self._next
-
-    def __repr__(self) -> str:  # pragma: no cover - trivial
-        return f"CashSecretSource(next_index={self._next})"

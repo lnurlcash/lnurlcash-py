@@ -13,7 +13,7 @@ raw-digest scheme anyway.
     digest  = sha256(sha256("Lightning Signed Message:" || message))
 
 The note id is ``hex(sha256(k1))`` for a Part 1 note, and for a Part 2 note
-the hex x-only public key its ck1 recovers to (see
+the verified hex x-only public key embedded in its ck1 (see
 :func:`~lnurlcash_kit.recoverable.note_id_of`), in which case the signature
 arrives as a ``cs1``. Either way the signature commits to something public,
 not the secret, so a holder can prove issuance - to expose a mint that will
@@ -34,19 +34,32 @@ _LIGHTNING_SIGNED_MESSAGE_PREFIX = b"Lightning Signed Message:"
 _DOMAIN_TAG = "LNURLcash"
 
 
-def address_proof_digest(action: str, username: str) -> bytes:
-    """Return the digest used to prove control of an address branch's
-    index-0 key. ``username`` must be the normalised value sent to the
-    SERVICE."""
+def address_proof_message(action: str, username: str) -> str:
+    """The message that proves control of an address branch's index-0 key,
+    bound to both action and username: ``LNURLcash:<action>:<username>``.
+    ``username`` must be the normalised value sent to the SERVICE."""
     if action not in ("register", "unregister"):
         raise ProtocolError("an address proof action is register or unregister")
-    message = f"{_DOMAIN_TAG}:{action}:{username}".encode()
-    return sha256(sha256(_LIGHTNING_SIGNED_MESSAGE_PREFIX + message).digest()).digest()
+    return f"{_DOMAIN_TAG}:{action}:{username}"
+
+
+def address_proof_digest(action: str, username: str) -> bytes:
+    """:func:`address_proof_message`, hashed to a 32-byte digest before
+    signing. ``username`` is variable-length, so the raw message would
+    otherwise only rarely land on the 32 bytes most Schnorr signers require -
+    the same reason ownership proofs are hashed (see
+    :func:`~lnurlcash_kit.recoverable.sign_note_ownership`)."""
+    return sha256(address_proof_message(action, username).encode("utf-8")).digest()
 
 
 def sign_address_proof(index_zero_secret_key: bytes, action: str, username: str) -> bytes:
-    """Sign a register/update or unregister proof as raw
-    ``r || s || recovery-id`` bytes."""
+    """Sign a register/update or unregister proof as a raw 64-byte BIP-340
+    signature over ``sha256`` of the protocol message, with 32 zero auxiliary
+    bytes.
+
+    This is a fresh action a WALLET initiates itself, never a stored bearer
+    secret read back later, so there is no old scheme to fall back to reading,
+    unlike ownership proofs."""
     key = bytes(index_zero_secret_key)
     if len(key) != 32:
         raise ProtocolError("an index-zero secret key is 32 bytes")
@@ -54,7 +67,7 @@ def sign_address_proof(index_zero_secret_key: bytes, action: str, username: str)
         signer = PrivateKey(key)
     except ValueError as err:
         raise ProtocolError("an index-zero secret key is a scalar in [1, n)") from err
-    return signer.sign_recoverable(address_proof_digest(action, username), hasher=None)
+    return signer.sign_schnorr(address_proof_digest(action, username), bytes(32))
 
 
 def _require_note_id(k1: str) -> str:
@@ -66,7 +79,7 @@ def _require_note_id(k1: str) -> str:
 
 def note_signature_message(k1: str, amount_msat: int) -> str:
     """The message a SERVICE signs for this note. Raises ``ProtocolError`` for
-    a k1 that is neither 32 bytes of hex nor a ck1 that recovers."""
+    a k1 that is neither 32 bytes of hex nor a valid ck1."""
     return note_signature_message_for_hash(_require_note_id(k1), amount_msat)
 
 
@@ -94,8 +107,8 @@ def verify_note_signature(
     ``k1`` may be a Part 1 secret or a Part 2 ck1, and ``signature_hex`` 65
     bytes of hex, a current amount-bearing cs1, or a legacy fixed-prefix cs1.
     Callers can decode the carried amount separately when they need it. A
-    ck1's note id is recovered locally, so checking a Part 2 note needs no
-    network either.
+    ck1's note id is the key it embeds and proves, found locally, so checking
+    a Part 2 note needs no network either.
 
     The signature is 65 bytes, but which end carries the recovery id varies by
     implementation: LUD-25 calls for ``r || s || recovery_id``, the layout raw
@@ -111,7 +124,7 @@ def verify_note_signature(
     """
     note_id = note_id_of(k1)
     if note_id is None:
-        # a malformed k1 cannot be hashed or recovered - not a crash, a "no"
+        # a malformed k1 cannot be hashed or verified - not a crash, a "no"
         return False
     return verify_note_signature_hash(note_id, amount_msat, signature_hex, mint_pubkey_hex)
 

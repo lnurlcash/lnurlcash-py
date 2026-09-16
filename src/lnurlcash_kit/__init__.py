@@ -10,7 +10,7 @@ Whoever knows the k1 controls the sats behind it, like a banknote. The
 authoritative value is always ``maxWithdrawable`` from an informational GET.
 
 A LUD-25 Part 2 note is the same link keyed by a public key instead: its k1 is
-a ``ck1``, a recoverable signature the mint recovers the key from. See
+a ``ck1``, that key and a BIP-340 Schnorr proof the mint verifies. See
 :mod:`lnurlcash_kit.recoverable`.
 
 Draft spec: https://github.com/lnurl/luds/pull/301
@@ -74,16 +74,13 @@ from .protocol import (
 )
 from .cash import (
     CashNode,
-    CashSecretSource,
     cash_domain_indices,
     cash_node_from_hex,
     cash_node_to_hex,
-    cash_secret_at,
     derive_cash_child,
     derive_cash_domain_node,
     derive_cash_master,
     derive_cash_root,
-    derive_cash_secret,
 )
 from .recoverable import (
     NOSTR_CASH_SEED_LABEL,
@@ -114,6 +111,7 @@ from .recoverable import (
     is_cx1,
     note_id_of,
     note_lookup_of,
+    note_ownership_message,
     recover_note_ownership_pubkey,
     sign_note_ownership,
 )
@@ -126,6 +124,7 @@ from .secrets import (
 )
 from .signature import (
     address_proof_digest,
+    address_proof_message,
     note_signature_digest,
     note_signature_digest_for_hash,
     note_signature_message,
@@ -198,16 +197,13 @@ __all__ = [
     "hash_k1",
     "is_preimage",
     "CashNode",
-    "CashSecretSource",
     "cash_domain_indices",
     "cash_node_from_hex",
     "cash_node_to_hex",
-    "cash_secret_at",
     "derive_cash_child",
     "derive_cash_domain_node",
     "derive_cash_master",
     "derive_cash_root",
-    "derive_cash_secret",
     "derive_note_root",
     "derive_note_secret",
     "NOSTR_CASH_SEED_LABEL",
@@ -238,9 +234,11 @@ __all__ = [
     "is_cx1",
     "note_id_of",
     "note_lookup_of",
+    "note_ownership_message",
     "recover_note_ownership_pubkey",
     "sign_note_ownership",
     "address_proof_digest",
+    "address_proof_message",
     "note_signature_digest",
     "note_signature_digest_for_hash",
     "note_signature_message",
