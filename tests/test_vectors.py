@@ -10,7 +10,7 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
-from coincurve import PrivateKey, PublicKey
+from coincurve import PrivateKey, PublicKey, PublicKeyXOnly
 
 from conftest import load_vectors
 from lnurlcash_kit.protocol import (
@@ -34,11 +34,11 @@ from lnurlcash_kit import (
     ServiceRejected,
     UnverifiableNote,
     address_proof_digest,
+    address_proof_message,
     cash_domain_indices,
     cash_node_from_hex,
     cash_node_to_cx1,
     cash_node_to_hex,
-    cash_secret_at,
     decode_any_cs1,
     decode_ck1,
     decode_cp1,
@@ -49,7 +49,6 @@ from lnurlcash_kit import (
     derive_cash_child,
     derive_cash_domain_node,
     derive_cash_root,
-    derive_cash_secret,
     derive_note_pubkey,
     derive_note_root,
     derive_note_secret,
@@ -69,6 +68,7 @@ from lnurlcash_kit import (
     is_cx1,
     note_id_of,
     note_lookup_of,
+    note_ownership_message,
     note_signature_digest_for_hash,
     note_signature_message_for_hash,
     recover_note_ownership_pubkey,
@@ -600,7 +600,6 @@ def test_verify_rejected(case):
 def test_cash_derivation_scheme_is_the_one_this_library_implements():
     scheme = load_vectors("cash-derivation.json")["scheme"]
     assert scheme["purpose"] == "m/139'"
-    assert scheme["secretPath"] == "m/139'/d1/d2/d3/d4/i'"
     # The one thing an implementation can silently get wrong: d1..d4 are raw
     # uint32, hardened only where they happen to land at or above 2^31.
     assert scheme["hardenedByMagnitudeOnly"] is True
@@ -629,12 +628,6 @@ def test_cash_derivation(case):
     domain_node = derive_cash_domain_node(root, case["host"])
     assert cash_node_to_hex(domain_node) == case["domainNode"]
 
-    assert derive_cash_secret(root, case["host"], case["index"]) == case["k1"]
-    # The hardware-signer path: given only this mint's subtree, with no seed
-    # and no elliptic curve, every note index still resolves.
-    assert cash_secret_at(domain_node, case["index"]) == case["k1"]
-    assert hash_k1(case["k1"]) == case["noteId"]
-
 
 def test_legacy_derivation_scheme():
     assert load_vectors("derivation.json")["scheme"]["rootKey"] == "lnurlcash-note-v1"
@@ -650,15 +643,14 @@ def test_legacy_derivation(case):
 
 # ---- LUD-25 Part 2 ----
 #
-# part2.json: notes keyed by a public key and spent by a recoverable
-# signature. Every field of every branch, note and certificate is bound to the
-# library here, including recovering each ck1 to its note key and each cs1 to
-# the mint's. A disagreement is a note one implementation mints and another
+# part2.json: notes keyed by a public key and spent by a BIP-340 Schnorr
+# proof. Every field of every branch, note and certificate is bound to the
+# library here, including verifying each ck1 against its note key and
+# recovering each cs1 to the mint's. A disagreement is a note one implementation mints and another
 # cannot find, or cannot spend.
 
 _PART2 = "part2.json"
 _HARDENED = 0x80000000
-_CURVE_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 _PART2_DECODERS = {
     "cp1": decode_cp1,
     "ck1": decode_ck1,
@@ -699,17 +691,20 @@ def _part2_notes() -> list[tuple[dict, dict]]:
 
 def test_part2_conventions_are_the_ones_this_library_implements():
     conventions = load_vectors(_PART2)["conventions"]
-    # the reference wallet's path, not the spec text's; see
-    # derive_cash_address_node for why that is the one that restores anything
-    assert conventions["addressBranch"] == "m/139'/1'/d1/d2/d3/d4"
-    assert conventions["hashingKey"] == "m/139'/1'/0"
+    # the spec text's literal path: the address branch is the domain node
+    assert conventions["addressBranch"] == "m/139'/d1/d2/d3/d4"
+    assert conventions["hashingKey"] == "m/139'/0"
     assert conventions["ownershipMessage"] == "LNURLcash"
+    assert note_ownership_message() == b"LNURLcash"
+    assert conventions["ownershipMessageEncoding"].startswith("UTF-8 bytes, sha256-hashed")
+    assert conventions["ownershipSignature"].startswith("BIP-340 Schnorr, 64 bytes")
+    assert conventions["ck1Payload"] == "32-byte x-only public key || 64-byte Schnorr signature"
     assert conventions["addressProofMessage"] == "LNURLcash:<register|unregister>:<username>"
+    assert conventions["addressProofMessageEncoding"].startswith("UTF-8 bytes, sha256-hashed")
     assert conventions["certificateMessage"] == "LNURLcash:<amount_msat>:<hex(pk)>"
     assert conventions["certificateHrp"] == "cs || BOLT11_amount_suffix(amount_msat)"
-    assert conventions["signatureLayout"].startswith("r || s || recovery id")
     assert conventions["indexWidth"].startswith("4 bytes, big-endian")
-    # the digest itself is bound in test_part2_note, by recovering the
+    # the digest itself is bound in test_part2_note, by verifying the
     # library's own signatures against it
 
 
@@ -717,15 +712,21 @@ def test_part2_conventions_are_the_ones_this_library_implements():
     "proof", _cases(_PART2, "addressProofs"), ids=lambda p: f"{p['action']}/{p['username']}"
 )
 def test_address_proof(proof):
+    message = address_proof_message(proof["action"], proof["username"])
+    assert message == proof["message"]
     digest = address_proof_digest(proof["action"], proof["username"])
     assert digest.hex() == proof["digest"]
+    assert digest == hashlib.sha256(message.encode("utf-8")).digest()
     signature = sign_address_proof(
         bytes.fromhex(proof["indexZeroSecretKey"]), proof["action"], proof["username"]
     )
     assert signature.hex() == proof["signature"]
+    assert PublicKeyXOnly(bytes.fromhex(proof["indexZeroPubkey"])).verify(signature, digest)
 
 
 def test_address_proof_rejects_unknown_action():
+    with pytest.raises(ProtocolError):
+        address_proof_message("delete", "alice")
     with pytest.raises(ProtocolError):
         address_proof_digest("delete", "alice")
 
@@ -748,13 +749,12 @@ def test_part2_branch(branch):
     root = derive_cash_root(seed)
     assert cash_node_to_hex(root) == branch["cashRoot"]
 
-    # d1..d4 hang off m/139'/1', one level below where the Part 1 ladder's do
-    address_root = derive_cash_child(root, 1 + _HARDENED)
-    assert list(cash_domain_indices(address_root, branch["host"])) == branch["domainIndices"]
+    # the hashing key is m/139'/0, so the four levels hang off the root itself
+    assert list(cash_domain_indices(root, branch["host"])) == branch["domainIndices"]
 
     node = derive_cash_address_node(root, branch["host"])
     assert cash_node_to_hex(node) == branch["addressNode"]
-    assert cash_node_to_hex(node) != cash_node_to_hex(
+    assert cash_node_to_hex(node) == cash_node_to_hex(
         derive_cash_domain_node(root, branch["host"])
     )
 
@@ -791,22 +791,19 @@ def test_part2_note(branch, note):
     assert encode_cp1(pk) == note["cp1"]
     assert decode_cp1(note["cp1"]) == pk
 
-    # RFC6979 and low-S, so re-deriving the key reproduces the ck1 byte for byte
-    signature = sign_note_ownership(sk)
-    assert signature.hex() == note["ownershipSignature"]
-    assert signature[64] <= 3
-    assert int.from_bytes(signature[32:64], "big") <= _CURVE_N // 2
-    assert encode_ck1(signature) == note["ck1"]
-    assert decode_ck1(note["ck1"]) == signature
+    # Fixed all-zero BIP-340 auxiliary input, so re-deriving the key
+    # reproduces the ck1 byte for byte for seed recovery
+    payload = sign_note_ownership(sk)
+    assert payload[:32] == pk
+    assert payload[32:].hex() == note["ownershipSignature"]
+    assert encode_ck1(payload) == note["ck1"]
+    assert decode_ck1(note["ck1"]) == payload
 
-    # Recovered twice: through the library, and straight off the vector's own
-    # digest, which pins exactly what the library signs over.
-    assert recover_note_ownership_pubkey(signature) == pk
-    digest = bytes.fromhex(load_vectors(_PART2)["conventions"]["ownershipDigest"])
-    recovered = PublicKey.from_signature_and_message(
-        decode_ck1(note["ck1"]), digest, hasher=None
-    )
-    assert recovered.format(compressed=True)[1:] == pk
+    # Verified twice: through the library, and straight off sha256 of the
+    # vector's own message, which pins exactly what the library signs over.
+    assert recover_note_ownership_pubkey(payload) == pk
+    message = load_vectors(_PART2)["conventions"]["ownershipMessage"].encode("utf-8")
+    assert PublicKeyXOnly(pk).verify(payload[32:], hashlib.sha256(message).digest())
 
     assert note_id_of(note["ck1"]) == note["notePubkey"]
     assert note_id_of(note["ck1"].upper()) == note["notePubkey"]
@@ -929,3 +926,109 @@ def test_nostr_seed(case):
         assert encode_cp1(pk) == note["cp1"]
         assert encode_ck1(sign_note_ownership(sk)) == note["ck1"]
         assert note_id_of(note["ck1"]) == note["notePubkey"]
+
+
+# ---- LUD-25's own published Test Vectors ----
+#
+# spec-vectors.json transcribes 25.md's "Test Vectors" section, so every value
+# here is what the spec document itself publishes, not just this project's own
+# internally generated fixtures. Checked against the library's real functions.
+
+_SPEC = "spec-vectors.json"
+
+
+def _spec_branch(case: dict):
+    root = derive_cash_root(bytes.fromhex(case["seedHex"]))
+    host = case["domain"]
+    assert derive_cash_child(root, 0).private_key.hex() == case["cashHashingKey"]
+    assert list(cash_domain_indices(root, host)) == case["domainIndices"]
+
+    branch = derive_cash_address_node(root, host)
+    assert cash_node_to_hex(branch) == cash_node_to_hex(derive_cash_domain_node(root, host))
+    assert branch.private_key.hex() == case["branchPrivateKey"]
+    assert branch.chain_code.hex() == case["chainCode"]
+
+    cx1 = cash_node_to_cx1(branch)
+    assert cx1.pubkey_x_only.hex() == case["branchPubkeyXOnly"]
+    assert encode_cx1(cx1.pubkey_x_only, cx1.chain_code) == case["cx1"]
+    return branch, cx1
+
+
+@pytest.mark.parametrize("name", ["vector1", "vector2"])
+def test_spec_vector_branch_and_notes(name):
+    case = load_vectors(_SPEC)[name]
+    branch, cx1 = _spec_branch(case)
+    for note in case["notes"]:
+        index = note["index"]
+        pk = derive_note_pubkey(cx1.pubkey_x_only, cx1.chain_code, index)
+        assert pk.hex() == note["pk"], index
+        assert encode_cp1(pk) == note["cp1"], index
+        sk = derive_note_secret_key(branch.private_key, branch.chain_code, index)
+        assert sk.hex() == note["sk"], index
+        # x(sk_i . G) == pk_i, the round trip 25.md calls out explicitly
+        assert PrivateKey(sk).public_key_xonly.format() == pk, index
+
+
+def test_spec_vector_address_proofs():
+    case = load_vectors(_SPEC)["vector2"]
+    branch, _ = _spec_branch(case)
+    sk0 = derive_note_secret_key(branch.private_key, branch.chain_code, 0)
+    for proof in case["addressProofs"]:
+        action, username = proof["action"], proof["username"]
+        assert address_proof_message(action, username) == proof["message"]
+        assert address_proof_digest(action, username).hex() == proof["digest"]
+        assert sign_address_proof(sk0, action, username).hex() == proof["signature"]
+
+
+def test_spec_vector_ck1():
+    case = load_vectors(_SPEC)["vector3"]
+    sk = bytes.fromhex(case["secretKey"])
+    payload = sign_note_ownership(sk)
+    assert payload[:32].hex() == case["pubkeyXOnly"]
+    assert hashlib.sha256(note_ownership_message()).hexdigest() == case["digest"]
+    assert payload[32:].hex() == case["ownershipSignature"]
+    assert encode_ck1(payload) == case["ck1"]
+    assert note_id_of(case["ck1"]) == case["pubkeyXOnly"]
+
+
+def test_spec_vector_cs1():
+    case = load_vectors(_SPEC)["vector4"]
+    mint_key = PrivateKey(bytes.fromhex(case["mintPrivateKey"]))
+    assert mint_key.public_key.format(compressed=True).hex() == case["mintPubkey"]
+    pk, other = case["notePubkey"], case["otherNotePubkey"]
+    for cert in case["certificates"]:
+        amount = cert["amountMsat"]
+        assert note_signature_message_for_hash(pk, amount) == cert["message"]
+        digest = note_signature_digest_for_hash(pk, amount)
+        assert digest.hex() == cert["digest"]
+        signature = mint_key.sign_recoverable(digest, hasher=None)
+        assert signature.hex() == cert["signature"]
+        assert encode_cs1_with_amount(amount, signature) == cert["cs1"]
+        assert verify_note_signature_hash(pk, amount, cert["signature"], case["mintPubkey"])
+        assert not verify_note_signature_hash(
+            other, amount, cert["signature"], case["mintPubkey"]
+        )
+
+
+def test_an_independent_wallet_derives_the_same_literal_path():
+    # Taken from lnurl-wallet itself rather than generated by the conformance
+    # suite: a BIP39 phrase (no passphrase) and the branch and first note key
+    # that wallet derives for one real mint host on the literal m/139'/d1..d4.
+    seed = _bip39_seed(
+        "dragon spell warfare girl patrol false erase surprise satisfy lucky curious ill"
+    )
+    assert seed.hex() == (
+        "1c77403f77e0c9c558fa00cdea65ec5c5b7eb9bd10880219b9f5d8fa259aad14"
+        "a81e9ad409641fd61ba3024de788cd88a1f0a27f0ff0a1a8ae140bd17bc3ee5c"
+    )
+    node = derive_cash_address_node(derive_cash_root(seed), "mint.lnurlcash.com")
+    assert node.private_key.hex() == (
+        "ec94d2f4f89e8ea4f4335970e9a7781e30b4223eb405b070f9e3930afccbdc9b"
+    )
+    assert node.chain_code.hex() == (
+        "62ba198d1cf6f086f85f867aff7f8d6845a65dd93152df219f1815d1f707bc99"
+    )
+    cx1 = cash_node_to_cx1(node)
+    assert derive_note_pubkey(cx1.pubkey_x_only, cx1.chain_code, 0).hex() == (
+        "6fb7c0137fc17fccb337947b361580b7686219f2eeab9d47ed52a49191d5136c"
+    )

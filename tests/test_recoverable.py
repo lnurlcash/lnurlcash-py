@@ -10,6 +10,7 @@ on.
 
 from __future__ import annotations
 
+from hashlib import sha256
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -96,17 +97,67 @@ def query(url: str) -> dict[str, list[str]]:
     return parse_qs(urlparse(url).query)
 
 
-def high_s_twin(ck1: str) -> str:
-    """The same signature with s -> n - s and the recovery id flipped.
+def legacy_ck1(secret_key_hex: str) -> str:
+    """The pre-Schnorr 65-byte ``r || s || recovery id`` ck1 for a note key:
+    a recoverable ECDSA signature over the Lightning-signed ``LNURLcash``.
 
-    Just as valid, and it recovers to the same key. A conforming signer never
-    makes it, but anyone holding a ck1 can, which makes it the simplest
-    second spelling of one note.
+    Nothing signs one of these anymore, but notes minted before the Schnorr
+    format carry one, and they stay readable so they can be rotated.
     """
-    signature = decode_ck1(ck1)
-    s = int.from_bytes(signature[32:64], "big")
-    flipped = (_CURVE_N - s).to_bytes(32, "big")
-    return encode_ck1(signature[:32] + flipped + bytes([signature[64] ^ 1]))
+    digest = sha256(sha256(b"Lightning Signed Message:LNURLcash").digest()).digest()
+    signature = PrivateKey(bytes.fromhex(secret_key_hex)).sign_recoverable(digest, hasher=None)
+    return bech32.encode("ck", signature, constant=bech32.BECH32M)
+
+
+def raw_message_ck1(secret_key: bytes) -> bytes:
+    """A 96-byte ck1 payload signed over the raw 9-byte ``LNURLcash`` rather
+    than its sha256 digest: the scheme before 2026-09-16. coincurve's signer
+    only takes 32-byte messages, so this is BIP-340 signing by hand."""
+    n = _CURVE_N
+    p = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+    G = (
+        0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+        0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8,
+    )
+
+    def add(a, b):
+        if a is None:
+            return b
+        if b is None:
+            return a
+        if a[0] == b[0] and a[1] != b[1]:
+            return None
+        if a == b:
+            lam = 3 * a[0] * a[0] * pow(2 * a[1], p - 2, p) % p
+        else:
+            lam = (b[1] - a[1]) * pow(b[0] - a[0], p - 2, p) % p
+        x = (lam * lam - a[0] - b[0]) % p
+        return x, (lam * (a[0] - x) - a[1]) % p
+
+    def mul(point, k):
+        out = None
+        while k:
+            if k & 1:
+                out = add(out, point)
+            point = add(point, point)
+            k >>= 1
+        return out
+
+    def tagged(tag: bytes, data: bytes) -> bytes:
+        return sha256(sha256(tag).digest() + sha256(tag).digest() + data).digest()
+
+    message = b"LNURLcash"
+    d0 = int.from_bytes(secret_key, "big")
+    P = mul(G, d0)
+    d = d0 if P[1] % 2 == 0 else n - d0
+    px = P[0].to_bytes(32, "big")
+    t = bytes(a ^ b for a, b in zip(d.to_bytes(32, "big"), tagged(b"BIP0340/aux", bytes(32))))
+    k0 = int.from_bytes(tagged(b"BIP0340/nonce", t + px + message), "big") % n
+    R = mul(G, k0)
+    k = k0 if R[1] % 2 == 0 else n - k0
+    rx = R[0].to_bytes(32, "big")
+    e = int.from_bytes(tagged(b"BIP0340/challenge", rx + px + message), "big") % n
+    return px + rx + ((k + e * d) % n).to_bytes(32, "big")
 
 
 # ---- a note's id, either kind ----
@@ -133,12 +184,35 @@ def test_anything_else_has_no_id(notes, cert):
             assert note_lookup_of(bad) is None
 
 
-def test_one_note_has_many_ck1_strings_so_notes_compare_by_id(notes):
-    # a wallet deduplicating notes by k1 string would count this one twice
+def test_one_key_reproduces_one_ck1(notes):
+    # all-zero auxiliary input: a wallet restored from its seed re-signs every
+    # note it ever held to the same string
+    sk = bytes.fromhex(notes[0]["noteSecretKey"])
+    assert sign_note_ownership(sk) == sign_note_ownership(sk)
+    assert encode_ck1(sign_note_ownership(sk)) == notes[0]["ck1"]
+
+
+def test_a_legacy_ck1_stays_readable_for_rotation(notes):
     a = notes[0]
-    twin = high_s_twin(a["ck1"])
-    assert twin != a["ck1"]
-    assert note_id_of(twin) == note_id_of(a["ck1"]) == a["notePubkey"]
+    legacy = legacy_ck1(a["noteSecretKey"])
+    assert len(decode_ck1(legacy)) == 65
+    assert is_ck1(legacy)
+    assert note_id_of(legacy) == a["notePubkey"]
+    assert note_lookup_of(legacy) == a["cp1"]
+    # read, never written: the encoder only takes the current 96 bytes
+    with pytest.raises(ProtocolError):
+        encode_ck1(decode_ck1(legacy))
+
+
+def test_a_raw_message_ck1_stays_readable_for_rotation(notes):
+    # Pre-2026-09-16: signed over the raw 9-byte "LNURLcash" string rather
+    # than its sha256 digest - sign_note_ownership never produces this
+    # anymore, but a note minted under it must stay redeemable.
+    a = notes[0]
+    payload = raw_message_ck1(bytes.fromhex(a["noteSecretKey"]))
+    assert payload != sign_note_ownership(bytes.fromhex(a["noteSecretKey"]))
+    assert recover_note_ownership_pubkey(payload) == bytes.fromhex(a["notePubkey"])
+    assert note_id_of(encode_ck1(payload)) == a["notePubkey"]
 
 
 def test_the_signed_message_is_over_the_key_for_a_ck1(notes):
@@ -173,12 +247,13 @@ def _echoing(part2: dict, k1: str) -> dict:
 
 
 def test_a_mint_echoing_another_spelling_of_the_same_note_is_believed(part2, notes):
-    # Asked with a's ck1, the mint echoes a's high-S twin. That names the same
-    # note, and refusing it would report a live note as redeemed elsewhere.
+    # Asked with a's ck1, the mint echoes a's legacy ck1. That proves the same
+    # key, so it names the same note, and refusing it would report a live note
+    # as redeemed elsewhere.
     a = notes[0]
-    twin = high_s_twin(a["ck1"])
+    legacy = legacy_ck1(a["noteSecretKey"])
     request = note_info_request(f"https://mint.example/w?k1={a['ck1']}&amount=21000")
-    info = request.parse(_echoing(part2, twin))
+    info = request.parse(_echoing(part2, legacy))
     assert note_id_of(info.k1) == a["notePubkey"]
     assert info.max_withdrawable == 21000
 
@@ -551,15 +626,23 @@ def test_a_bad_branch_private_key_is_refused(part2):
 # ---- ownership signatures ----
 
 
-def test_a_truncated_or_corrupted_signature_does_not_recover_to_the_note(notes):
+def test_a_truncated_or_corrupted_signature_is_not_the_note(notes):
     a = notes[0]
-    signature = decode_ck1(a["ck1"])
-    assert recover_note_ownership_pubkey(signature[:64]) is None
-    assert recover_note_ownership_pubkey(signature[:64] + b"\x04") is None
+    payload = decode_ck1(a["ck1"])
+    assert len(payload) == 96
+    assert recover_note_ownership_pubkey(payload) == bytes.fromhex(a["notePubkey"])
+    assert recover_note_ownership_pubkey(payload[:95]) is None
+    assert recover_note_ownership_pubkey(payload[:64]) is None
+    assert recover_note_ownership_pubkey(b"") is None
+    assert recover_note_ownership_pubkey(bytes([0xFF]) * 96) is None
     assert recover_note_ownership_pubkey("not bytes") is None
-    corrupted = bytearray(signature)
-    corrupted[10] ^= 0xFF
-    assert recover_note_ownership_pubkey(bytes(corrupted)) != bytes.fromhex(a["notePubkey"])
+    for at in (10, 40, 90):
+        corrupted = bytearray(payload)
+        corrupted[at] ^= 0xFF
+        assert recover_note_ownership_pubkey(bytes(corrupted)) != bytes.fromhex(a["notePubkey"])
+    # a key and a valid signature by a different key is not a proof
+    b = decode_ck1(notes[1]["ck1"])
+    assert recover_note_ownership_pubkey(payload[:32] + b[32:]) is None
 
 
 def test_signing_refuses_a_key_that_is_not_one():

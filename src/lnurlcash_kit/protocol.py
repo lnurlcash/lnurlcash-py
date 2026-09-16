@@ -361,12 +361,10 @@ def _reject_error(body: Any) -> None:
 def _same_note(a: str, b: str) -> bool:
     """Whether two k1s name one note.
 
-    A Part 1 secret has one spelling, but a Part 2 note has as many valid ck1s
-    as a signer has nonces - and anyone can flip a signature to its high-S
-    twin - so a SERVICE echoing a different ck1 that recovers to the same key
-    has named the same note, not a different one. Every LNURLcash kit compares
-    the echo this way. Anything that is not a note at all still has to match
-    as text, as it always did.
+    Exact spelling is preferred; valid ck1 values may also be compared by
+    their verified embedded note key, so a legacy and a current ck1 for one
+    key name the same note. Anything that is not a note at all still has to
+    match as text, as it always did.
     """
     if a.strip().lower() == b.strip().lower():
         return True
@@ -922,9 +920,7 @@ def mint_invoice_request(
     The secret comes back on :attr:`Request.new_secrets`. **Persist it before
     paying the invoice this returns.** Paying for a note and then losing its
     secret is the one way the comment-bound scheme is worse than the preimage
-    one it replaced, and persisting first removes it entirely. Drawing the
-    secret from the seed derivation rather than the CSPRNG makes the note
-    recoverable from birth, without any rotate at all.
+    one it replaced, and persisting first removes it entirely.
     """
     # Checked before hashing, so a malformed secret is RequestRefused - the
     # caller's own input, nothing sent - rather than an error that accuses the

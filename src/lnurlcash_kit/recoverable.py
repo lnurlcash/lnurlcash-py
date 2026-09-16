@@ -1,16 +1,14 @@
-"""LUD-25 Part 2: notes keyed by a public key and spent by a recoverable
-signature.
+"""LUD-25 Part 2: notes keyed by a public key and spent by a Schnorr proof.
 
 A Part 2 note is keyed by a public key rather than a hash. The holder keeps
 ``sk``, discloses ``pk`` as ``cp1<pk>``, and spends the note with ``ck1``, a
-recoverable signature by ``sk`` over a fixed message: the SERVICE recovers
-``pk`` from it and looks the note up. The SERVICE certifies each note with
-``cs1``, the same signature it has always made, over ``hex(pk)`` instead of a
-hash, so a recipient can check issuance offline.
+BIP-340 signature by ``sk`` over a fixed message, paired with ``pk``: the
+SERVICE verifies the pair and looks the note up by ``pk``. The SERVICE
+certifies each note with ``cs1``, the same signature it has always made, over
+``hex(pk)`` instead of a hash, so a recipient can check issuance offline.
 
 The names mirror lnurlcash-kit's TypeScript, which takes them from
-lnurl-wallet's ``src/lib``, in snake_case. Where the spec text and that code
-disagree, this follows the code: see :func:`derive_cash_address_node`. Graded
+lnurl-wallet's ``src/lib``, in snake_case. Graded
 against lnurlcash-conformance's ``vectors/part2.json``, which is built from the
 primitives and matches vectors generated from lnurl-wallet and checked against
 lnurl-mint.
@@ -22,14 +20,13 @@ import hmac
 from dataclasses import dataclass
 from hashlib import sha256
 
-from coincurve import PrivateKey, PublicKey
+from coincurve import PrivateKey, PublicKey, PublicKeyXOnly
 
 from . import bech32
-from .cash import CashNode, derive_cash_child, derive_cash_domain_node, derive_cash_root
+from .cash import CashNode, derive_cash_domain_node, derive_cash_root
 from .errors import ProtocolError
 from .secrets import hash_k1, is_preimage
 
-_HARDENED = 0x80000000
 _CURVE_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 
 # ---- bech32m ----
@@ -71,14 +68,20 @@ def is_cp1(value: str) -> bool:
     return decode_cp1(value) is not None
 
 
-def encode_ck1(signature: bytes) -> str:
-    """A note's bearer secret: the 65-byte ``r || s || recovery id`` ownership
-    signature. Whoever holds this string holds the note."""
-    return _encode_fixed("ck", signature, 65)
+def encode_ck1(payload: bytes) -> str:
+    """A note's bearer secret: its 32-byte x-only public key followed by its
+    64-byte BIP-340 signature. Whoever holds this string holds the note."""
+    return _encode_fixed("ck", payload, 96)
 
 
 def decode_ck1(value: str) -> bytes | None:
-    return _decode_fixed("ck", value, 65)
+    """The payload inside a ``ck1``: 96 bytes for the current ``pk || sig``
+    form, or 65 bytes for a pre-Schnorr recoverable-ECDSA bearer, accepted
+    only so existing notes remain spendable long enough to rotate into the
+    current format. The length says which. :func:`encode_ck1` only takes the
+    current form."""
+    current = _decode_fixed("ck", value, 96)
+    return current if current is not None else _decode_fixed("ck", value, 65)
 
 
 def is_ck1(value: str) -> bool:
@@ -312,28 +315,40 @@ def derive_note_secret_key(
 
 # ---- ownership proofs ----
 #
-#     message = "LNURLcash"
-#     digest  = sha256(sha256("Lightning Signed Message:" || message))
+#     sig = BIP340.Sign(sk, sha256("LNURLcash"))
+#     ck1 = bech32m("ck", pk || sig)
 #
-# One fixed message for every note, so the value submitted to spend a note is
-# the value shown to prove it. RFC6979 makes it deterministic, so re-deriving a
-# key reproduces the same ck1. Other valid signatures by the same key exist,
-# though (a high-S twin, or a signer with a different nonce), so a note is
-# identified by the key its ck1 recovers to, never by the string.
+# One fixed digest and fixed all-zero BIP-340 auxiliary input make the bearer
+# value deterministic: re-deriving a key reproduces its one ck1 byte for byte.
+# The message is hashed to 32 bytes before signing (rather than signed as the
+# raw 9-byte ASCII string) because BIP-340's own reference implementation, and
+# most conforming Schnorr signers (libsecp256k1's schnorrsig module, which
+# coincurve wraps, included), only accept a 32-byte message (2026-09-16,
+# luds#6de59b2).
 
+_NOTE_OWNERSHIP_MESSAGE = b"LNURLcash"
+_NOTE_OWNERSHIP_DIGEST = sha256(_NOTE_OWNERSHIP_MESSAGE).digest()
+_ZERO_AUX = bytes(32)
 _LIGHTNING_SIGNED_MESSAGE_PREFIX = b"Lightning Signed Message:"
-_NOTE_OWNERSHIP_DIGEST = sha256(
-    sha256(_LIGHTNING_SIGNED_MESSAGE_PREFIX + b"LNURLcash").digest()
+_LEGACY_NOTE_OWNERSHIP_DIGEST = sha256(
+    sha256(_LIGHTNING_SIGNED_MESSAGE_PREFIX + _NOTE_OWNERSHIP_MESSAGE).digest()
 ).digest()
 
 
-def sign_note_ownership(secret_key: bytes) -> bytes:
-    """The raw 65 bytes, ``r || s || recovery id``. Encode with
-    :func:`encode_ck1` for the wire.
+def note_ownership_message() -> bytes:
+    """The raw message every ownership signature was made over before the
+    2026-09-16 32-byte digest change. Kept only for reading a ck1 that
+    verifies under that scheme, not for signing."""
+    return _NOTE_OWNERSHIP_MESSAGE
 
-    libsecp256k1 signs with RFC6979 nonces and always returns low-S, and
-    coincurve lays a recoverable signature out with the recovery id last,
-    which is already the wire order.
+
+def sign_note_ownership(secret_key: bytes) -> bytes:
+    """The 96-byte ``pk || sig`` ownership payload. Encode with
+    :func:`encode_ck1` for the wire: that string spends the note, so it is as
+    secret as the key.
+
+    ``sig`` is BIP-340 over ``sha256("LNURLcash")`` with 32 zero auxiliary
+    bytes, so a wallet restored from its seed reproduces every ck1 exactly.
     """
     key = bytes(secret_key)
     # checked here because coincurve zero-pads a short key rather than
@@ -344,17 +359,41 @@ def sign_note_ownership(secret_key: bytes) -> bytes:
         signer = PrivateKey(key)
     except ValueError as err:
         raise ProtocolError("a note secret key is a scalar in [1, n)") from err
-    return signer.sign_recoverable(_NOTE_OWNERSHIP_DIGEST, hasher=None)
+    signature = signer.sign_schnorr(_NOTE_OWNERSHIP_DIGEST, _ZERO_AUX)
+    return signer.public_key_xonly.format() + signature
 
 
-def recover_note_ownership_pubkey(signature: bytes) -> bytes | None:
-    """The note's x-only public key, recovered offline from its ownership
-    signature, or None if the signature does not recover. Never raises."""
-    if not isinstance(signature, (bytes, bytearray)) or len(signature) != 65:
+def recover_note_ownership_pubkey(payload: bytes) -> bytes | None:
+    """Validate an ownership payload and return its note's x-only public key,
+    or None for an invalid proof or the wrong length. Never raises.
+
+    A 96-byte ``pk || sig`` is checked against the current sha256 digest
+    first, then against the pre-2026-09-16 raw ``LNURLcash`` message, so a
+    note minted under that scheme stays redeemable until it is rotated -
+    :func:`sign_note_ownership` never produces that shape anymore, it is only
+    read back here. A 65-byte legacy recoverable-ECDSA signature is recovered
+    against the Lightning-signed digest it was made over, for the same reason.
+    """
+    if not isinstance(payload, (bytes, bytearray)):
+        return None
+    payload = bytes(payload)
+    if len(payload) == 96:
+        try:
+            key = PublicKeyXOnly(payload[:32])
+            signature = payload[32:]
+            if key.verify(signature, _NOTE_OWNERSHIP_DIGEST) or key.verify(
+                signature, _NOTE_OWNERSHIP_MESSAGE
+            ):
+                return payload[:32]
+        except Exception:
+            # a pubkey that is not on the curve
+            return None
+        return None
+    if len(payload) != 65:
         return None
     try:
         recovered = PublicKey.from_signature_and_message(
-            bytes(signature), _NOTE_OWNERSHIP_DIGEST, hasher=None
+            payload, _LEGACY_NOTE_OWNERSHIP_DIGEST, hasher=None
         )
     except Exception:
         # a recovery id above 3, r or s out of range, or no point at all
@@ -367,19 +406,18 @@ def recover_note_ownership_pubkey(signature: bytes) -> bytes | None:
 
 def note_id_of(k1: str) -> str | None:
     """The id a SERVICE files a note under: ``sha256(k1)`` for a Part 1
-    secret, and the recovered public key, as hex, for a Part 2 ck1.
+    secret, and the verified public key, as hex, for a Part 2 ck1.
 
-    None for anything else, including a ck1 that does not recover. Two
-    different ck1 strings can share an id, so compare notes by this, never by
-    k1.
+    None for anything else, an invalid ck1 included. Compare notes by this,
+    never by an unverified payload.
     """
     if not isinstance(k1, str):
         return None
     value = k1.strip().lower()
     if is_preimage(value):
         return hash_k1(value)
-    signature = decode_ck1(value)
-    pubkey = recover_note_ownership_pubkey(signature) if signature is not None else None
+    payload = decode_ck1(value)
+    pubkey = recover_note_ownership_pubkey(payload) if payload is not None else None
     return pubkey.hex() if pubkey is not None else None
 
 
@@ -398,19 +436,19 @@ def note_lookup_of(k1: str) -> str | None:
 
 
 def derive_cash_address_node(root: CashNode, host: str) -> CashNode:
-    """``m/139'/1'/d1/d2/d3/d4`` for one mint, with ``d1..d4`` from
-    HMAC-SHA256(key = the private key at ``m/139'/1'/0``, msg = host), used
-    exactly as they fall, as LUD-05 does.
-
-    This is lnurl-wallet's path, and it is the one to use. The spec text roots
-    the branch at ``m/139'/d1..d4``, the very node the Part 1 ladder
-    (:func:`~lnurlcash_kit.cash.derive_cash_domain_node`) already uses, so a
-    wallet following the text would find none of the reference wallet's notes.
+    """``m/139'/d1/d2/d3/d4`` for one mint - the literal path LUD-25's text
+    specifies, and the exact node
+    :func:`~lnurlcash_kit.cash.derive_cash_domain_node` already derives for any
+    SERVICE. There is no separate purpose for Part 2: an earlier
+    reference-wallet extension deterministically derived Part 1 secrets off
+    this same root too, under a ``1'`` sub-purpose kept just for this branch to
+    avoid colliding with it; that extension is gone (see
+    :mod:`~lnurlcash_kit.cash`), so there is nothing left to collide with.
 
     Bearer material for every note on the branch. Hand out
     :func:`cash_node_to_cx1` of it, never the node.
     """
-    return derive_cash_domain_node(derive_cash_child(root, 1 + _HARDENED), host)
+    return derive_cash_domain_node(root, host)
 
 
 def cash_node_to_cx1(node: CashNode) -> Cx1:
@@ -431,7 +469,7 @@ def cash_node_to_cx1(node: CashNode) -> Cx1:
 #
 #     seed = HMAC-SHA256(key = the identity's secret key, msg = "LNURLcash/nostr-seed")
 #
-# then lnurl-wallet's address path from that seed, unchanged. heartwood-esp32
+# then the address path from that seed, unchanged. heartwood-esp32
 # derives exactly this on the device, and lnurlcash-conformance's
 # vectors/nostr-seed.json holds both to it. The identity key rebuilds every
 # note paid to the branch, so whoever can restore that key can recover the
