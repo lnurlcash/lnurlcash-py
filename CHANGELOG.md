@@ -3,7 +3,7 @@
 Semantic versioning. While the LUD-25 draft is unmerged, `0.x` minor bumps may
 carry breaking changes; pin an exact version.
 
-## Unreleased
+## 0.3.0 - 2026-11-05
 
 **Breaking, for wallets as much as for code.** Follows LUD-26 as split out of
 LUD-25 (lnurl/luds `b62b8bf` and `a6c4652`, through `92e430f`), and grades
