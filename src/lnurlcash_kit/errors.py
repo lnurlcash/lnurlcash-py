@@ -84,14 +84,17 @@ class NoteUnknown(ServiceRejected):
 
 
 class OutputInUse(ServiceRejected):
-    """LUD-25's {"status":"ERROR","reason":"already in use"}: an output
-    the request named, ``p1`` or ``p2``, is already outstanding or was burned
-    before, so the SERVICE refused rather than credit value into a note
-    somebody else may hold the spend for. Nothing was burned. Name a fresh
-    output - the next index, for a key derived from a branch - and try
-    again."""
+    """lnurl-mint's older ``Output already in use.``: an output the request
+    named, ``p1`` or ``p2``, is already outstanding or was burned before, so
+    the SERVICE refused rather than credit value into a note somebody else may
+    hold the spend for. Nothing was burned. Name a fresh output - the next
+    index, for a key derived from a share or the wallet chain - and try again.
 
-    def __init__(self, reason: str = "already in use") -> None:
+    LUD-25's exact ``already in use`` is NOT this: it is also how a SERVICE
+    answers a burned note, and :func:`classify_note_error` reads it as
+    :class:`NoteSpent`. :func:`is_already_in_use` matches both."""
+
+    def __init__(self, reason: str = "Output already in use.") -> None:
         super().__init__(reason)
         self.args = (
             "An output this request named is already in use - name a fresh one.",
@@ -173,6 +176,15 @@ def new_secrets_of(err: BaseException) -> list[str]:
     return []
 
 
+def is_already_in_use(err: BaseException) -> bool:
+    """Whether the SERVICE answered ``already in use`` (LUD-25) in any form:
+    either a note being spent was burned, or an output is somebody's already.
+    A recovery scan counts it as a used index."""
+    if isinstance(err, (ServiceRejected, OutputInUse)):
+        return "already in use" in err.reason.lower()
+    return False
+
+
 def classify_note_error(reason: str) -> ServiceRejected:
     """A SERVICE's wording for "this k1 is dead" varies by implementation and
     by endpoint. An informational GET can afford to distinguish "Note already
@@ -180,14 +192,26 @@ def classify_note_error(reason: str) -> ServiceRejected:
     possibly multi-k1 request - can only say something like "Invalid or
     already spent k1.", since it cannot tell which case applies to which k1.
 
+    LUD-25 fixes one wording (luds 92abbb3): a burned note is answered exactly
+    ``already in use``, at the informational GET and at the callback alike.
+    Every caller of this is asking about a note being spent, so that exact
+    reason is :class:`NoteSpent`, and the fresh secrets of a mutation that may
+    have applied stay attached. The same reason also refuses a ``p1``/``p2``
+    that is already somebody's note, and from the wording alone the two are
+    one: a caller that named its own outputs and needs to know which it was
+    looks its inputs up. This library's own rotate, split and merge mint to
+    fresh secrets, which nobody else holds, so for them it is the spent input.
+    lnurl-mint's older ``Output already in use.`` names the output, and is
+    :class:`OutputInUse`.
+
     The reason must be passed through exactly as the SERVICE sent it, empty
     string included. Substituting a friendly default first would be read back
     here as though the SERVICE had said it: "Unknown service error" matches
     the rule for an unknown note, and reports one on no evidence at all.
     """
     lowered = reason.lower()
-    # LUD-25 says exactly "already in use"; lnurl-mint says "Output already
-    # in use.", so it is matched as a phrase, as lnurl-wallet does
+    if lowered.strip() == "already in use":
+        return NoteSpent(reason)
     if "already in use" in lowered:
         return OutputInUse(reason)
     if "spent" in lowered:

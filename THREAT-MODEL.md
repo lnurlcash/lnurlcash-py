@@ -18,8 +18,17 @@ any mint that holds its note; a `ck1` only at the mint whose domain it
 signed. Compromise is theft, and it is silent and irreversible: the money is
 gone before the previous holder has any way to notice.
 
-**Note keys and address branches.** A note key signs its `ck1`, so it is the
-note. An address node derives every note key on its branch.
+**Note keys, service roots and shares.** A note key signs its `ck1`, so it is
+the note. A SERVICE root `S` derives every note key the wallet will hold at
+that mint, and a share node (`S/a'/2/n'`) every note key on that share, so
+both are provisioning material, never something to hand out. A share's `cx1`
+is the watch-only half: it spends nothing, but whoever holds it can list every
+key on the share and link them. Note indices are not hardened, so a leaked
+note key together with its share's `cx1` exposes every other note still on
+that share, since the pair gives up the share's own key. Use a fresh
+share for every party, and rotate what arrives there into wallet notes
+promptly. Accounts and shares are hardened, so a leak on one never reaches
+another account, another share, or the wallet and change chains.
 
 **Replacement secrets awaiting confirmation.** After a mutation whose outcome
 is unknown, the secrets generated in-process may be the only copies of notes
@@ -58,8 +67,10 @@ canonical transaction whose prevout is `tagged_hash("LNURLcash/mint",
 domain)`, so a signature one mint has seen verifies nowhere else.
 `sign_note_ownership` takes the domain from whatever URL or host it is given
 and keeps only the lowercase hostname, so a scheme, a port or a case
-difference cannot silently sign for a mint that does not exist. A register
-or unregister proof binds the domain the same way. A bearer note's spend
+difference cannot silently sign for a mint that does not exist. A register,
+update or unregister proof binds the domain the same way, and the `cx1` it
+puts on file, so a captured proof cannot be replayed at another SERVICE or with
+another chain code and parity around the same `x(P)`. A bearer note's spend
 signs nothing and is bound to no mint: it spends its note wherever the note
 exists, exactly as a plain `k1` always has.
 
@@ -93,14 +104,21 @@ would otherwise mint a self-contained fake note that verifies against
 nothing.
 
 **A service that inflates a note.** A certificate (`cs1`) commits to the
-amount and to the note's `hex(Q)`, for every note, a bearer note included. A
+mint's domain, the amount and the note's `hex(Q)`, for every note, a bearer
+note included, so it vouches for the one mint on that domain and never for a
+note at another. A `cs1` whose prefix states another amount than the one it
+signed, or whose recovery id is not last and 0 to 3, is not a current
+certificate. A
 service reporting more than it signed fails verification, without the holder
 contacting anyone. This library always demands a certificate for an output
 named by `cp1`; the tolerant default admits an uncertified output named by a
 bearer `h` from a mint with no signer, and that particular note has no offline
-amount check. A certificate over a bearer note's `h`, the message mints used
-before notes were keyed by `Q`, is still read and reported as
-`CERTIFIED_OVER_HASH`, so a caller can tell a mint that has not caught up.
+amount check. Two older messages are still read and never written: `hex(Q)` with no domain
+(before luds `92abbb3`), reported as `CERTIFIED_OVER_LEGACY_Q`, which proves
+issuance by that key but not at which of its mints; and a bearer note's `h`,
+the message mints used before notes were keyed by `Q`, reported as
+`CERTIFIED_OVER_HASH`. A caller can tell a mint that has not caught up, and
+should have it re-issue `c`.
 
 **A service that swaps your note.** The informational GET checks that the
 echoed `k1` is the one queried, or another spend that opens the same `Q` at
@@ -113,6 +131,10 @@ informational GET, since the service already knows what it signed.
 **A hostile fee advertisement.** Fees of 100% or more are refused at parse
 time, and the gross-up search is a binary search rather than a walk — so a
 service cannot stall a caller with an extreme fee.
+The address fee, LUD-26's third `Mint fees` value, is parsed under the same
+rules (digits only, at most 2^53 - 1) and is only an advertisement: this
+library builds no registration request, so a caller that pays one must refuse a
+`pr` that exceeds the `address_fee_msat` it was told.
 
 **Integer overflow on realistic amounts.** Python integers are arbitrary
 precision, so this cannot bite here - but the proportional fee term is still

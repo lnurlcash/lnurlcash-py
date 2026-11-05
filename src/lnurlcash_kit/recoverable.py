@@ -26,7 +26,15 @@ from hashlib import sha256
 from coincurve import PrivateKey, PublicKey, PublicKeyXOnly
 
 from . import bech32
-from .cash import CashNode, derive_cash_domain_node, derive_cash_root
+from .cash import (
+    CashNode,
+    cash_node_public_key,
+    derive_cash_child,
+    derive_cash_child_pub,
+    derive_cash_domain_node,
+    derive_cash_root,
+    derive_service_root,
+)
 from .errors import ProtocolError
 from .secrets import hash_k1, is_preimage
 from .spend import (
@@ -182,7 +190,9 @@ def decode_cs1_with_amount(value: str) -> Cs1 | None:
     """Decode a current certificate and the amount carried by its prefix.
 
     The legacy fixed ``cs`` prefix returns ``None`` because it carries no
-    amount.
+    amount, and so does a recovery id above 3: ``r || s || recovery_id`` is
+    what LUD-25 has a SERVICE issue, and nothing else is a current
+    certificate.
     """
     if not isinstance(value, str):
         return None
@@ -190,7 +200,7 @@ def decode_cs1_with_amount(value: str) -> Cs1 | None:
     if decoded is None:
         return None
     prefix, payload = decoded
-    if not prefix.startswith("cs") or len(payload) != 65:
+    if not prefix.startswith("cs") or len(payload) != 65 or payload[64] > 3:
         return None
     amount_msat = _decode_cs1_amount_suffix(prefix[2:])
     if amount_msat is None:
@@ -214,58 +224,227 @@ def is_any_cs1(value: str) -> bool:
 
 @dataclass(frozen=True)
 class Cx1:
-    """A watch-only branch: its x-only public key and chain code.
-
-    Anyone holding one can list every note key on the branch, and link them,
-    but cannot spend any. Not secret the way a :class:`CashNode` is, but not
-    something to publish either.
+    """A share's extended public key (LUD-26): its chain code and compressed
+    point, in BIP-32's order. Whoever holds one can derive every note key on
+    the share with :func:`derive_note_pubkey`, and link them all to each
+    other, but can spend none of them.
     """
 
-    pubkey_x_only: bytes
     chain_code: bytes
+    #: compressed, ``02`` or ``03`` first
+    pubkey: bytes
+
+    @property
+    def pubkey_x_only(self) -> bytes:
+        """``x(P)``: what a registration proof by this share verifies
+        against."""
+        return self.pubkey[1:]
 
 
-def encode_cx1(pubkey_x_only: bytes, chain_code: bytes) -> str:
-    if len(pubkey_x_only) != 32 or len(chain_code) != 32:
-        raise ProtocolError(
-            "a cx1 is a 32-byte x-only public key and a 32-byte chain code"
-        )
-    return _encode_fixed("cx", bytes(pubkey_x_only) + bytes(chain_code), 64)
+def encode_cx1(cx1: Cx1) -> str:
+    """``bech32m("cx", chainCode || P)``, 113 characters."""
+    if len(cx1.chain_code) != 32 or len(cx1.pubkey) != 33:
+        raise ProtocolError("a cx1 is a 32-byte chain code and a 33-byte compressed key")
+    return _encode_fixed("cx", bytes(cx1.chain_code) + bytes(cx1.pubkey), 65)
 
 
 def decode_cx1(value: str) -> Cx1 | None:
-    payload = _decode_fixed("cx", value, 64)
-    return Cx1(payload[:32], payload[32:]) if payload is not None else None
+    """None unless the payload is 65 bytes and its last 33 a compressed curve
+    point. The superseded 64-byte shape is :func:`decode_legacy_cx1`'s, and no
+    SERVICE registers one any more."""
+    payload = _decode_fixed("cx", value, 65)
+    if payload is None:
+        return None
+    pubkey = payload[32:]
+    if pubkey[0] not in (2, 3):
+        return None
+    try:
+        PublicKey(pubkey)
+    except ValueError:
+        return None
+    return Cx1(payload[:32], pubkey)
 
 
 def is_cx1(value: str) -> bool:
     return decode_cx1(value) is not None
 
 
-# ---- the per-note key tweak ----
+# ---- LUD-26: notes below a SERVICE's root ----
 #
-#     t    = tagged_hash("LNURLcash/derive",
-#                        P || chainCode || ser32_be(purpose) || ser32_be(i)) mod n
+#   S            = m/139'/d1/d2/d3/d4      see derive_service_root
+#   S/a'/0/i     wallet: every note the wallet mints, rotates or merges into, and a split's p1
+#   S/a'/1/i     change: a split's p2
+#   S/a'/2/n'    share n, handed out as its cx1
+#   S/a'/2/n'/i  note i of share n, picked and credited by the SERVICE
+#
+# Plain BIP-32 all the way down: a note's secret key is the private key at its
+# path and its Q is x(sk*G), so any BIP-32 library derives the same tree, and
+# a SERVICE holding a share's cx1 derives that share's notes with CKDpub
+# alone. Accounts and shares are hardened, so no account's or share's keys can
+# be derived from another's; note indices are not, and are below 2^31.
+
+#: every note the wallet mints, rotates or merges into, and a split's ``p1``
+CHAIN_WALLET = 0
+#: a split's change ``p2``
+CHAIN_CHANGE = 1
+#: the shares, each exported as a ``cx1``
+CHAIN_SHARE = 2
+
+_HARDENED = 0x80000000
+
+
+def _below_hardened(value: int, what: str) -> int:
+    # bool is an int to Python, and True is not an index anyone meant
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < _HARDENED:
+        raise ProtocolError(f"{what} {value!r} is not below 2^31")
+    return value
+
+
+@dataclass(frozen=True)
+class NotePath:
+    """Where a note sits below a SERVICE's root. Build one with
+    :meth:`wallet`, :meth:`change` or :meth:`share`."""
+
+    chain: int
+    account: int
+    index: int
+    #: the share, for a share note only
+    share: int | None = None
+
+    @classmethod
+    def wallet(cls, account: int, index: int) -> NotePath:
+        """``S/account'/0/index``"""
+        return cls(CHAIN_WALLET, account, index)
+
+    @classmethod
+    def change(cls, account: int, index: int) -> NotePath:
+        """``S/account'/1/index``"""
+        return cls(CHAIN_CHANGE, account, index)
+
+    @classmethod
+    def for_share(cls, account: int, share: int, index: int) -> NotePath:
+        """``S/account'/2/share'/index``. Only a SERVICE picks these indices;
+        a wallet never names one as a resulting note itself."""
+        return cls(CHAIN_SHARE, account, index, share)
+
+    def indices(self) -> list[int]:
+        """The BIP-32 indices below ``S``, hardened ones included."""
+        out = [_below_hardened(self.account, "an account") + _HARDENED, self.chain]
+        if self.chain == CHAIN_SHARE:
+            if self.share is None:
+                raise ProtocolError("a share note names its share")
+            out.append(_below_hardened(self.share, "a share") + _HARDENED)
+        elif self.chain not in (CHAIN_WALLET, CHAIN_CHANGE) or self.share is not None:
+            raise ProtocolError("a note path is wallet, change or share")
+        out.append(_below_hardened(self.index, "a note index"))
+        return out
+
+
+@dataclass(frozen=True)
+class NoteKey:
+    """A note's keys. Bearer material: the secret key spends the note."""
+
+    secret_key: bytes
+    #: compressed, so its y parity is visible: a BIP-340 signer negates the
+    #: secret key when it is odd
+    pubkey: bytes
+    #: ``Q = x(pubkey)``, the note itself
+    output_key: bytes
+
+    def __repr__(self) -> str:  # pragma: no cover - trivial
+        return f"NoteKey(output_key={self.output_key.hex()}, secret_key=redacted)"
+
+
+def derive_note_key(service_root: CashNode, path: NotePath) -> NoteKey:
+    """The note at ``path`` below ``service_root``
+    (:func:`~lnurlcash_kit.cash.derive_service_root`)."""
+    node = service_root
+    for index in path.indices():
+        node = derive_cash_child(node, index)
+    pubkey = cash_node_public_key(node)
+    return NoteKey(node.private_key, pubkey, pubkey[1:])
+
+
+def derive_share_node(service_root: CashNode, account: int, share: int) -> CashNode:
+    """``S/account'/2/share'``, the node behind a share's ``cx1``. Bearer
+    material for every note on the share: hand out :func:`cash_node_to_cx1` of
+    it, and sign its registration with its own key
+    (:func:`~lnurlcash_kit.signature.sign_address_proof`)."""
+    node = derive_cash_child(service_root, _below_hardened(account, "an account") + _HARDENED)
+    node = derive_cash_child(node, CHAIN_SHARE)
+    return derive_cash_child(node, _below_hardened(share, "a share") + _HARDENED)
+
+
+def cash_node_to_cx1(node: CashNode) -> Cx1:
+    """A share node's ``cx1``."""
+    return Cx1(bytes(node.chain_code), cash_node_public_key(node))
+
+
+def derive_note_pubkey(cx1: Cx1, index: int) -> bytes:
+    """``Q`` of note ``index`` on the share ``cx1`` exports: CKDpub, no private
+    key anywhere, which is what lets a SERVICE credit a registered share's next
+    note. A hardened index is refused, and an unusable one (~2^-127) is an
+    error: use the next."""
+    pubkey, _ = derive_cash_child_pub(cx1.pubkey, cx1.chain_code, index)
+    return pubkey[1:]
+
+
+# ---- superseded: the per-note tweak ----
+#
+# Before LUD-26 (luds a6c4652), note keys were tweaked off one branch node,
+# m/139'/d1/d2/d3/d4 over the host as stored (port included), and a cx1 was
+# the 64-byte x(P) || chainCode:
+#
+#     t    = tagged_hash("LNURLcash/derive", P || chainCode || ser32(purpose) || ser32(i)) mod n
 #     pk_i = x(lift_x(P) + t*G)
 #     sk_i = ((P has even y ? p : n - p) + t) mod n
 #
-# BIP-341's taproot tweak, so a watcher holding only the cx1 computes the same
-# pk_i the holder does. purpose and i are any uint32 and never hardened. The
-# purpose splits a branch into three independent counters (LUD-25, Seed &
-# derivation), so a wallet's own indices and a SERVICE's auto-minted ones never
-# collide by coincidence. The 4-byte big-endian width is what lnurl-wallet and
-# lnurl-mint both use; the spec text does not pin it.
+# purpose 0 was the wallet's own notes, 1 a split's change and 2 the Lightning
+# Address rail (luds 50d740a); before purposes (luds 6e865b1) there was no
+# ser32(purpose) at all. Notes minted under either are still money, so a
+# wallet derives them here to find and sweep them into LUD-26 keys. Nothing
+# new is ever derived or registered this way.
 
-#: every note the wallet itself mints, rotates or merges into, and a split's
-#: resulting note (p1). The registration proof and the address key use index 0
-#: of this purpose.
-PURPOSE_WALLET = 0
-#: a split's change note (p2)
-PURPOSE_CHANGE = 1
-#: a note credited by Lightning Address auto-mint or an internal transfer
-PURPOSE_LIGHTNING_ADDRESS = 2
+#: purpose 0 of the superseded tweak: the wallet's own notes
+LEGACY_PURPOSE_WALLET = 0
+#: purpose 1 of the superseded tweak: a split's change
+LEGACY_PURPOSE_CHANGE = 1
+#: purpose 2 of the superseded tweak: Lightning Address auto-mint and internal
+#: transfer
+LEGACY_PURPOSE_LIGHTNING_ADDRESS = 2
 
 _NOTE_DERIVE_TAG = sha256(b"LNURLcash/derive").digest()
+
+
+@dataclass(frozen=True)
+class LegacyCx1:
+    """A superseded 64-byte ``cx1``, ``x(P) || chainCode``."""
+
+    pubkey_x_only: bytes
+    chain_code: bytes
+
+
+def encode_legacy_cx1(cx1: LegacyCx1) -> str:
+    if len(cx1.pubkey_x_only) != 32 or len(cx1.chain_code) != 32:
+        raise ProtocolError("a legacy cx1 is a 32-byte x-only key and a 32-byte chain code")
+    return _encode_fixed("cx", bytes(cx1.pubkey_x_only) + bytes(cx1.chain_code), 64)
+
+
+def decode_legacy_cx1(value: str) -> LegacyCx1 | None:
+    payload = _decode_fixed("cx", value, 64)
+    return LegacyCx1(payload[:32], payload[32:]) if payload is not None else None
+
+
+def legacy_branch_node(root: CashNode, host: str) -> CashNode:
+    """The node the superseded schemes tweaked their notes off:
+    ``m/139'/d1/d2/d3/d4`` for ``host`` exactly as the wallet stored it, port
+    included. Bearer material for every note it ever held there under them."""
+    return derive_cash_domain_node(root, host)
+
+
+def legacy_cx1_of(node: CashNode) -> LegacyCx1:
+    """The superseded watch-only half of a :func:`legacy_branch_node`."""
+    return LegacyCx1(cash_node_public_key(node)[1:], bytes(node.chain_code))
 
 
 def _unusable(index: int) -> ProtocolError:
@@ -275,7 +454,6 @@ def _unusable(index: int) -> ProtocolError:
 
 
 def _require_uint32(index: int, what: str = "index") -> int:
-    # bool is an int to Python, and True is not an index anyone meant
     if isinstance(index, bool) or not isinstance(index, int):
         raise ProtocolError(f"a note {what} must be a uint32, not {index!r}")
     if not 0 <= index <= 0xFFFFFFFF:
@@ -284,70 +462,55 @@ def _require_uint32(index: int, what: str = "index") -> int:
 
 
 def _tweak_for(
-    pubkey_x_only: bytes, chain_code: bytes, index: int, purpose: int
+    pubkey_x_only: bytes, chain_code: bytes, purpose: int | None, index: int
 ) -> int:
+    # purpose None is the pre-purpose scheme
     if len(pubkey_x_only) != 32 or len(chain_code) != 32:
         raise ProtocolError(
             "a branch is a 32-byte x-only public key and a 32-byte chain code"
         )
-    ser_purpose = _require_uint32(purpose, "purpose").to_bytes(4, "big")
-    ser = _require_uint32(index).to_bytes(4, "big")
-    material = (
-        _NOTE_DERIVE_TAG + _NOTE_DERIVE_TAG + pubkey_x_only + chain_code + ser_purpose + ser
-    )
-    # reduced mod n, as the spec requires and lnurl-wallet does (lnurl-mint
-    # refuses t >= n instead; at ~2^-128 the two never meet)
-    return int.from_bytes(sha256(material).digest(), "big") % _CURVE_N
+    parts = [_NOTE_DERIVE_TAG, _NOTE_DERIVE_TAG, pubkey_x_only, chain_code]
+    if purpose is not None:
+        parts.append(_require_uint32(purpose, "purpose").to_bytes(4, "big"))
+    parts.append(_require_uint32(index).to_bytes(4, "big"))
+    # reduced mod n, as the spec required and lnurl-wallet did (lnurl-mint
+    # refused t >= n instead; at ~2^-128 the two never meet)
+    return int.from_bytes(sha256(b"".join(parts)).digest(), "big") % _CURVE_N
 
 
-def derive_note_pubkey(
-    branch_pubkey_x_only: bytes,
-    chain_code: bytes,
-    index: int,
-    purpose: int = PURPOSE_WALLET,
-) -> bytes:
-    """The note at ``purpose`` and ``index``: its x-only public key, from the
-    branch's public half alone.
-
-    Watch-only: it needs no private key, which is what lets a SERVICE holding
-    a registered cx1 mint straight to the holder's next key.
-    """
-    branch_x = bytes(branch_pubkey_x_only)
-    t = _tweak_for(branch_x, bytes(chain_code), index, purpose)
+def legacy_derive_note_pubkey(cx1: LegacyCx1, purpose: int | None, index: int) -> bytes:
+    """A note's x-only key under the superseded tweak, from the legacy ``cx1``
+    half alone. ``purpose`` is None for the scheme before purposes existed."""
+    branch_x = bytes(cx1.pubkey_x_only)
+    t = _tweak_for(branch_x, bytes(cx1.chain_code), purpose, index)
     try:
         branch = PublicKey(b"\x02" + branch_x)
     except ValueError as err:
-        raise ProtocolError("that branch key is not a point on secp256k1") from err
+        raise ProtocolError("a branch key is not an x-only secp256k1 point") from err
     if t == 0:
         return branch_x
     try:
-        # P + t*G. coincurve refuses the point at infinity, the one other way
-        # an index can be unusable
+        # lift_x(P) + t*G. coincurve refuses the point at infinity, the one
+        # other way an index can be unusable
         note = branch.add(t.to_bytes(32, "big"))
     except ValueError as err:
         raise _unusable(index) from err
     return note.format(compressed=True)[1:]
 
 
-def derive_note_secret_key(
-    branch_private_key: bytes,
-    chain_code: bytes,
-    index: int,
-    purpose: int = PURPOSE_WALLET,
+def legacy_derive_note_secret_key(
+    node: CashNode, purpose: int | None, index: int
 ) -> bytes:
-    """The holder's half: the 32-byte secret key of the note at ``purpose`` and
-    ``index``.
-
-    The branch key's own point may have odd y, and a cx1 carries only x, which
-    names the even-y point, so the key is negated first. Without that the note
-    keys would not match what a watcher derives from the cx1.
-    """
-    key = bytes(branch_private_key)
+    """The secret key behind :func:`legacy_derive_note_pubkey`, from a
+    :func:`legacy_branch_node`. The branch key's own point may have odd y, and
+    a legacy ``cx1`` only carried x, which names the even-y point, so the key
+    is negated first."""
+    key = bytes(node.private_key)
     p = int.from_bytes(key, "big")
     if len(key) != 32 or not 0 < p < _CURVE_N:
         raise ProtocolError("a branch private key is a 32-byte scalar in [1, n)")
     branch = PrivateKey(key).public_key.format(compressed=True)
-    t = _tweak_for(branch[1:], bytes(chain_code), index, purpose)
+    t = _tweak_for(branch[1:], bytes(node.chain_code), purpose, index)
     even = p if branch[0] == 0x02 else _CURVE_N - p
     note = (even + t) % _CURVE_N
     if note == 0:
@@ -615,49 +778,21 @@ def note_lookup_of(k1: str) -> str | None:
     return encode_cp1(spend.output_key) if spend is not None else None
 
 
-# ---- the address branch ----
-
-
-def derive_cash_address_node(root: CashNode, host: str) -> CashNode:
-    """``m/139'/d1/d2/d3/d4`` for one mint - the literal path LUD-25's text
-    specifies, and the exact node
-    :func:`~lnurlcash_kit.cash.derive_cash_domain_node` already derives for any
-    SERVICE. There is no separate purpose for key-path notes: an earlier
-    reference-wallet extension deterministically derived bearer preimages off
-    this same root too, under a ``1'`` sub-purpose kept just for this branch to
-    avoid colliding with it; that extension is gone (see
-    :mod:`~lnurlcash_kit.cash`), so there is nothing left to collide with.
-
-    Bearer material for every note on the branch. Hand out
-    :func:`cash_node_to_cx1` of it, never the node.
-    """
-    return derive_cash_domain_node(root, host)
-
-
-def cash_node_to_cx1(node: CashNode) -> Cx1:
-    """A node's watch-only half: what :func:`encode_cx1` encodes."""
-    try:
-        point = PrivateKey(node.private_key).public_key.format(compressed=True)
-    except ValueError as err:
-        raise ProtocolError("cash node holds an invalid private key") from err
-    return Cx1(point[1:], bytes(node.chain_code))
-
-
 # ---- a branch rooted in a Nostr key ----
 #
-# An extension, not LUD-25. A lightning address on a Nostr-native mint belongs
-# to an npub, and a holder with no BIP-39 words - a hardware signer that keeps
-# only its identity key, or a wallet that never made any - can still be paid to
-# keys of its own:
+# An extension, not LUD-25/26. A lightning address on a Nostr-native mint
+# belongs to an npub, and a holder with no BIP-39 words - a hardware signer
+# that keeps only its identity key, or a wallet that never made any - can
+# still be paid to keys of its own:
 #
 #     seed = HMAC-SHA256(key = the identity's secret key, msg = "LNURLcash/nostr-seed")
 #
-# then the address path from that seed, unchanged. heartwood-esp32
-# derives exactly this on the device, and lnurlcash-conformance's
+# then LUD-26's tree from that seed, unchanged. heartwood-esp32 derives
+# exactly this on the device, and lnurlcash-conformance's
 # vectors/nostr-seed.json holds both to it. The identity key rebuilds every
-# note paid to the branch, so whoever can restore that key can recover the
-# notes, with or without the device that received them. A mint sees an
-# ordinary cx1 either way.
+# note on the tree, so whoever can restore that key can recover the notes,
+# with or without the device that received them. A mint sees an ordinary cx1
+# either way.
 
 NOSTR_CASH_SEED_LABEL = "LNURLcash/nostr-seed"
 
@@ -672,9 +807,7 @@ def derive_nostr_cash_seed(secret_key: bytes) -> bytes:
     ).digest()
 
 
-def derive_nostr_address_node(secret_key: bytes, host: str) -> CashNode:
-    """One mint's address branch for a Nostr identity. Bearer material, like
-    any address node: hand out :func:`cash_node_to_cx1` of it."""
-    return derive_cash_address_node(
-        derive_cash_root(derive_nostr_cash_seed(secret_key)), host
-    )
+def derive_nostr_service_root(secret_key: bytes, domain: str) -> CashNode:
+    """One mint's LUD-26 root ``S`` for a Nostr identity. Bearer material, like
+    any SERVICE root: hand out a share's :func:`cash_node_to_cx1`."""
+    return derive_service_root(derive_cash_root(derive_nostr_cash_seed(secret_key)), domain)
