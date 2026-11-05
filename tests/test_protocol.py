@@ -30,18 +30,23 @@ from lnurlcash_kit import (
     bearer_cw1,
     bearer_note_id,
     build_note_url,
+    classify_note_error,
     encode_ck1,
     encode_cp1,
     hash_k1,
+    is_already_in_use,
     new_secrets_of,
     resolve_note_input,
     sign_note_ownership,
     verify_note_signature,
 )
 from lnurlcash_kit.protocol import (
+    PayRequestInfo,
+    internal_transfer_request,
     mint_address_request,
     note_info_by_hash_request,
     note_info_request,
+    parse_internal_transfer,
 )
 
 
@@ -219,7 +224,11 @@ def test_rotate_signature_verifies_offline(mint, client):
     assert not verify_note_signature(rotated.k1, m.url, 21001, rotated.signature, m.pubkey)
 
 
-def test_accepts_the_other_recovery_id_layout(mint, client):
+def test_accepts_the_other_recovery_id_layout_as_legacy(mint, client):
+    # A mint from before luds 92abbb3 that forwarded its node's signmessage
+    # output unreordered, recovery_id || r || s, over the message without a
+    # domain. Notes people hold carry such certificates, so they still verify,
+    # as legacy; a current certificate is only ever r || s || recovery_id.
     m = mint(signatureLayout="leading")
     k1 = secret()
     m.credit(k1, 21000)
@@ -227,7 +236,7 @@ def test_accepts_the_other_recovery_id_layout(mint, client):
     rotated = client.rotate_note(info.callback, k1)
     assert (
         verify_note_signature(rotated.k1, m.url, 21000, rotated.signature, m.pubkey)
-        is Certification.CERTIFIED_OVER_Q
+        is Certification.CERTIFIED_OVER_LEGACY_Q
     )
 
 
@@ -876,15 +885,33 @@ def test_an_output_already_in_use_is_refused_and_burns_nothing(mint, client):
     m.credit(taken, 1000)
     callback = f"{m.url}/w/cb"
 
-    with pytest.raises(OutputInUse) as raised:
+    # LUD-25 answers a taken output and a burned input alike, exactly
+    # "already in use". It is read as spent so the fresh secrets stay attached
+    # (a caller that named its own output tells the two apart by its inputs),
+    # and it is still an in-use answer.
+    with pytest.raises(NoteSpent) as raised:
         client.rotate_note_with_hash(callback, source, hash_k1(taken))
-    assert not isinstance(raised.value, (NoteSpent, NoteUnknown))
-    assert new_secrets_of(raised.value) == []
+    assert is_already_in_use(raised.value)
+    assert not isinstance(raised.value, OutputInUse)
+    assert len(new_secrets_of(raised.value)) == 0  # named outputs: nothing generated
     assert m.note_state(source) == "outstanding"
     # the same output named by its cp1 is the same note, and just as taken
     taken_cp1 = encode_cp1(bytes.fromhex(bearer_note_id(hash_k1(taken))))
-    with pytest.raises(OutputInUse):
+    with pytest.raises(NoteSpent):
         client.rotate_note_with_hash(callback, source, taken_cp1)
+    # and the input really was outstanding, so the output was the taken one
+    assert client.fetch_note_info(m.note_url(source)).max_withdrawable == 21000
+
+
+def test_a_burned_note_is_spent_and_the_older_wording_is_an_output():
+    for reason in ("already in use", "Already in use", " already in use "):
+        err = classify_note_error(reason)
+        assert isinstance(err, NoteSpent) and not isinstance(err, OutputInUse), reason
+        assert is_already_in_use(err), reason
+    err = classify_note_error("Output already in use.")
+    assert isinstance(err, OutputInUse) and is_already_in_use(err)
+    assert not is_already_in_use(classify_note_error("Unknown note."))
+    assert not is_already_in_use(ValueError("already in use"))
 
 
 def test_lnurl_mints_wording_of_already_in_use():
@@ -911,5 +938,56 @@ def test_certificates_are_read_under_either_name(mint, client, names):
     signature = m.credit(k1, 21000)
     assert signature
     info = client.fetch_note_info(m.note_url(k1))
-    assert info.signature == signature
-    assert verify_note_signature(k1, m.url, 21000, info.signature, m.pubkey)
+    assert info.signature
+    assert (
+        verify_note_signature(k1, m.url, 21000, info.signature, m.pubkey)
+        is Certification.CERTIFIED_OVER_Q
+    )
+
+
+# ---- LUD-26 internal transfer ----
+
+_PREIMAGE = "0001020304050607080910111213141516171819202122232425262728293031"
+
+
+def _payee(withdraw_link: str | None) -> PayRequestInfo:
+    return PayRequestInfo(
+        callback="https://mint.example/.well-known/lnurlp/bob/cb",
+        min_sendable=1000,
+        max_sendable=100_000_000,
+        metadata="[]",
+        withdraw_link=withdraw_link,
+    )
+
+
+@pytest.mark.parametrize("link", ["https://mint.example/w", "lnurlw://MINT.example/w"])
+def test_an_internal_transfer_sends_the_whole_note_to_the_callback(link):
+    request = internal_transfer_request(
+        _payee(link), "https://mint.example:443/w?k1=x", _PREIMAGE, 21_000
+    )
+    assert request.url == (
+        f"https://mint.example/.well-known/lnurlp/bob/cb?amount=21000&k1={_PREIMAGE}"
+    )
+    assert not request.new_secrets and not request.replayable
+
+
+def test_an_internal_transfer_never_leaves_the_notes_mint():
+    # no withdrawLink, or one at another mint: the spend would go to a SERVICE
+    # that does not hold the note
+    for payee in (_payee(None), _payee("https://other.example/w")):
+        with pytest.raises(RequestRefused):
+            internal_transfer_request(payee, "mint.example", _PREIMAGE, 21_000)
+    payee = _payee("https://mint.example/w")
+    for amount in (999, 100_000_001):
+        with pytest.raises(RequestRefused):
+            internal_transfer_request(payee, "mint.example", _PREIMAGE, amount)
+    with pytest.raises(RequestRefused):
+        internal_transfer_request(payee, "mint.example", "not a spend", 21_000)
+
+
+def test_an_internal_transfer_answer_is_ok_refused_or_ambiguous():
+    parse_internal_transfer({"status": "OK"})
+    with pytest.raises(NoteSpent):
+        parse_internal_transfer({"status": "ERROR", "reason": "already in use"})
+    with pytest.raises(AmbiguousMint):
+        parse_internal_transfer({"tag": "payRequest"})

@@ -38,12 +38,27 @@ from lnurlcash_kit import (
     derive_cash_child,
     derive_cash_master,
     derive_cash_root,
-    PURPOSE_CHANGE,
-    PURPOSE_LIGHTNING_ADDRESS,
-    PURPOSE_WALLET,
+    LEGACY_PURPOSE_CHANGE,
+    LEGACY_PURPOSE_LIGHTNING_ADDRESS,
+    LEGACY_PURPOSE_WALLET,
+    Cx1,
+    LegacyCx1,
+    NotePath,
+    cash_node_to_cx1,
+    decode_legacy_cx1,
+    derive_cash_child_pub,
+    derive_cash_domain_node,
+    derive_note_key,
     derive_note_pubkey,
-    derive_note_secret_key,
     derive_nostr_cash_seed,
+    derive_nostr_service_root,
+    derive_service_root,
+    derive_share_node,
+    encode_legacy_cx1,
+    legacy_branch_node,
+    legacy_cx1_of,
+    legacy_derive_note_pubkey,
+    legacy_derive_note_secret_key,
     encode_ck1,
     encode_cp1,
     encode_cs1_with_amount,
@@ -93,15 +108,19 @@ def part2() -> dict:
 @pytest.fixture(scope="module")
 def notes(part2) -> list[dict]:
     """The first branch's notes: a, b and c below."""
-    return part2["branches"][0]["notes"]
+    return part2["branches"][0]["accounts"][0]["wallet"]
 
 
 @pytest.fixture(scope="module")
 def cert(part2) -> dict:
     """A certificate for the first branch's first note, at 1000 msat."""
     found = part2["certificates"][0]
-    assert found["notePubkey"] == part2["branches"][0]["notes"][0]["notePubkey"]
+    assert found["notePubkey"] == part2["branches"][0]["accounts"][0]["wallet"][0]["notePubkey"]
     return found
+
+
+def _share_cx1(part2: dict) -> str:
+    return part2["branches"][0]["accounts"][0]["shares"][0]["cx1"]
 
 
 def query(url: str) -> dict[str, list[str]]:
@@ -263,11 +282,16 @@ def test_a_fixed_message_ck1_stays_readable_for_rotation(notes, make):
 
 def test_the_signed_message_is_over_the_key_for_a_ck1(notes):
     a = notes[0]
-    assert note_signature_message(a["ck1"], 21000) == f"LNURLcash:21000:{a['notePubkey']}"
+    message = f"LNURLcash:mint.example:21000:{a['notePubkey']}"
+    assert note_signature_message(a["ck1"], DOMAIN, 21000) == message
+    # the domain is the hostname, however the mint's address is spelled
+    assert note_signature_message(a["ck1"], "https://MINT.example:3338/w", 21000) == message
     with pytest.raises(ProtocolError):
-        note_signature_message("not a k1", 21000)
+        note_signature_message("not a k1", DOMAIN, 21000)
     with pytest.raises(ProtocolError):
-        note_signature_message(a["cp1"], 21000)
+        note_signature_message(a["cp1"], DOMAIN, 21000)
+    with pytest.raises(ProtocolError):
+        note_signature_message(a["ck1"], "", 21000)
 
 
 # ---- note URLs and lookups ----
@@ -539,7 +563,7 @@ def test_anything_else_is_refused_before_an_invoice_is_asked_for(notes, cert):
 
 
 def test_the_five_types_never_pass_for_one_another(part2, notes, cert):
-    a, cx1, cw1 = notes[0], part2["branches"][0]["cx1"], bearer_cw1(K1)
+    a, cx1, cw1 = notes[0], _share_cx1(part2), bearer_cw1(K1)
     checks = (is_cp1, is_ck1, is_cw1, is_cs1_with_amount, is_cx1)
     assert [check(a["cp1"]) for check in checks] == [True, False, False, False, False]
     assert [check(a["ck1"]) for check in checks] == [False, True, False, False, False]
@@ -560,7 +584,7 @@ def test_an_off_curve_cp1_names_no_note():
 
 def test_no_90_character_limit(notes, cert, part2):
     # BIP-173's limit is for segwit addresses; LUD-25 does not adopt it
-    for value in (notes[0]["ck1"], cert["cs1"], part2["branches"][0]["cx1"]):
+    for value in (notes[0]["ck1"], cert["cs1"], _share_cx1(part2)):
         assert len(value) > 90
     assert decode_ck1(notes[0]["ck1"]) is not None
 
@@ -613,7 +637,9 @@ def test_encoders_refuse_a_payload_of_the_wrong_length():
     with pytest.raises(ProtocolError):
         encode_cs1_with_amount(1, bytes(64))
     with pytest.raises(ProtocolError):
-        encode_cx1(bytes(32), bytes(31))
+        encode_cx1(Cx1(bytes(31), bytes(33)))
+    with pytest.raises(ProtocolError):
+        encode_legacy_cx1(LegacyCx1(bytes(31), bytes(32)))
 
 
 @pytest.mark.parametrize("amount", [0, 1, 99, 100, 21_000, 2**63 - 1])
@@ -636,7 +662,171 @@ def test_lnurl_decoding_is_untouched_by_bech32m():
     assert bech32.decode(lnurl, constant=bech32.BECH32M) is None
 
 
-# ---- the key tweak ----
+# ---- BIP-32 below a SERVICE's root ----
+
+
+def _service_root(part2: dict):
+    branch = part2["branches"][0]
+    return derive_service_root(
+        derive_cash_root(bytes.fromhex(branch["seedHex"])), branch["domain"]
+    )
+
+
+def test_a_note_index_is_below_2_pow_31(part2):
+    root = _service_root(part2)
+    for path in (
+        NotePath.wallet(0, 0x80000000),
+        NotePath.change(0x80000000, 0),
+        NotePath.for_share(0, 0x80000000, 0),
+        NotePath.wallet(0, -1),
+        NotePath.wallet(0, True),
+        NotePath.wallet(0, 1.5),
+        NotePath.wallet("0", 0),
+    ):
+        with pytest.raises(ProtocolError):
+            derive_note_key(root, path)
+    # the largest index that is not a hardened step still derives
+    assert derive_note_key(root, NotePath.wallet(0, 0x7FFFFFFF))
+    share = cash_node_to_cx1(derive_share_node(root, 0, 0))
+    with pytest.raises(ProtocolError):
+        derive_note_pubkey(share, 0x80000000)
+    for bad in (-1, 2**32, True, 1.5):
+        with pytest.raises(ProtocolError):
+            derive_note_pubkey(share, bad)
+
+
+def test_a_malformed_note_path_is_refused(part2):
+    root = _service_root(part2)
+    for path in (
+        NotePath(3, 0, 0),
+        NotePath(0, 0, 0, share=0),
+        NotePath(2, 0, 0),
+    ):
+        with pytest.raises(ProtocolError):
+            derive_note_key(root, path)
+
+
+def test_the_three_chains_and_two_accounts_are_independent_keys(part2):
+    root = _service_root(part2)
+    keys = {
+        derive_note_key(root, path).output_key
+        for path in (
+            NotePath.wallet(0, 0),
+            NotePath.change(0, 0),
+            NotePath.for_share(0, 0, 0),
+            NotePath.wallet(1, 0),
+        )
+    }
+    assert len(keys) == 4
+
+
+def test_a_service_root_is_derived_for_the_domain_not_the_host(part2):
+    root = derive_cash_root(bytes.fromhex(part2["branches"][0]["seedHex"]))
+    plain = derive_service_root(root, "mint.example")
+    for spelling in ("MINT.example", "https://mint.example/w", "lnurlw://mint.example:3338/w"):
+        assert derive_service_root(root, spelling).private_key == plain.private_key
+    # for a host without a port the superseded node is the same one
+    assert derive_cash_domain_node(root, "mint.example").private_key == plain.private_key
+    # with a port they part company: the old node hashed it
+    assert (
+        derive_cash_domain_node(root, "mint.example:3338").private_key != plain.private_key
+    )
+    with pytest.raises(ProtocolError):
+        derive_service_root(root, "")
+
+
+def test_ckdpub_agrees_with_ckdpriv_and_refuses_hardened_children(part2):
+    root = _service_root(part2)
+    node = derive_share_node(root, 0, 0)
+    cx1 = cash_node_to_cx1(node)
+    child = derive_cash_child(node, 5)
+    pub, chain = derive_cash_child_pub(cx1.pubkey, cx1.chain_code, 5)
+    assert pub == PrivateKey(child.private_key).public_key.format(compressed=True)
+    assert chain == child.chain_code
+    with pytest.raises(ProtocolError):
+        derive_cash_child_pub(cx1.pubkey, cx1.chain_code, 0x80000000)
+    with pytest.raises(ProtocolError):
+        derive_cash_child_pub(bytes([2]) + bytes(31) + b"\x05", cx1.chain_code, 0)
+    with pytest.raises(ProtocolError):
+        derive_cash_child_pub(cx1.pubkey[:32], cx1.chain_code, 0)
+
+
+def test_a_cx1_is_113_characters_and_refuses_what_is_not_a_point(part2):
+    cx1 = decode_cx1(_share_cx1(part2))
+    assert cx1 is not None and len(_share_cx1(part2)) == 113
+    assert len(cx1.chain_code) == 32 and len(cx1.pubkey) == 33
+    assert cx1.pubkey_x_only == cx1.pubkey[1:]
+    with pytest.raises(ProtocolError):
+        encode_cx1(Cx1(cx1.chain_code, cx1.pubkey[1:]))
+    # a 65-byte payload whose key is not a compressed point is no cx1
+    for key in (bytes([4]) + bytes(32), bytes([2]) + (5).to_bytes(32, "big")):
+        assert decode_cx1(encode_cx1_unchecked(cx1.chain_code + key)) is None
+
+
+def encode_cx1_unchecked(payload: bytes) -> str:
+    return bech32.encode("cx", payload, constant=bech32.BECH32M)
+
+
+def test_the_secret_key_of_a_note_is_never_printed(part2):
+    root = _service_root(part2)
+    key = derive_note_key(root, NotePath.wallet(0, 0))
+    assert key.secret_key.hex() not in repr(key)
+    assert key.output_key.hex() in repr(key)
+
+
+# ---- the superseded tweak, read only ----
+
+
+def _legacy_branch(part2: dict):
+    branch = part2["legacy"]["branches"][0]
+    root = derive_cash_root(bytes.fromhex(_seed_of(branch)))
+    node = legacy_branch_node(root, branch["host"])
+    return node, legacy_cx1_of(node)
+
+
+def _seed_of(branch: dict) -> str:
+    import hashlib
+    import unicodedata
+
+    phrase = unicodedata.normalize("NFKD", branch["mnemonic"]).encode("utf-8")
+    return hashlib.pbkdf2_hmac("sha512", phrase, b"mnemonic", 2048).hex()
+
+
+def test_the_legacy_index_is_a_uint32(part2):
+    node, cx1 = _legacy_branch(part2)
+    for bad in [-1, 2**32, 1.5, True, "0"]:
+        with pytest.raises(ProtocolError):
+            legacy_derive_note_pubkey(cx1, LEGACY_PURPOSE_WALLET, bad)
+        with pytest.raises(ProtocolError):
+            legacy_derive_note_secret_key(node, LEGACY_PURPOSE_WALLET, bad)
+
+
+def test_a_legacy_tweak_at_or_above_n_is_reduced_mod_n(part2, monkeypatch):
+    # A ~2^-128 event nobody will meet, but the spec required t mod n, and
+    # lnurl-wallet reduced it: 2^256 - 1 derives exactly what 2^256 - 1 - n does
+    node, cx1 = _legacy_branch(part2)
+    reduced = (2**256 - 1 - _CURVE_N).to_bytes(32, "big")
+    monkeypatch.setattr(recoverable, "sha256", lambda _data: _Digest(reduced))
+    want_pk = legacy_derive_note_pubkey(cx1, LEGACY_PURPOSE_WALLET, 0)
+    want_sk = legacy_derive_note_secret_key(node, LEGACY_PURPOSE_WALLET, 0)
+    monkeypatch.setattr(recoverable, "sha256", lambda _data: _Digest(b"\xff" * 32))
+    assert legacy_derive_note_pubkey(cx1, LEGACY_PURPOSE_WALLET, 0) == want_pk
+    assert legacy_derive_note_secret_key(node, LEGACY_PURPOSE_WALLET, 0) == want_sk
+    assert PrivateKey(want_sk).public_key.format(compressed=True)[1:] == want_pk
+
+
+def test_a_legacy_tweak_that_lands_on_zero_is_refused(part2, monkeypatch):
+    # t = n - p puts the note key at zero and its point at infinity: the other
+    # way an index is unusable, and the same answer
+    node, cx1 = _legacy_branch(part2)
+    p = int.from_bytes(node.private_key, "big")
+    even = PrivateKey(node.private_key).public_key.format(compressed=True)[0] == 0x02
+    t = _CURVE_N - (p if even else _CURVE_N - p)
+    monkeypatch.setattr(recoverable, "sha256", lambda _data: _Digest(t.to_bytes(32, "big")))
+    with pytest.raises(ProtocolError, match="next index"):
+        legacy_derive_note_pubkey(cx1, LEGACY_PURPOSE_WALLET, 0)
+    with pytest.raises(ProtocolError, match="next index"):
+        legacy_derive_note_secret_key(node, LEGACY_PURPOSE_WALLET, 0)
 
 
 class _Digest:
@@ -647,60 +837,61 @@ class _Digest:
         return self._value
 
 
-def _branch(part2: dict) -> tuple[bytes, bytes, bytes]:
-    branch = part2["branches"][0]
-    node = cash_node_from_hex(branch["addressNode"])
-    return node.private_key, bytes.fromhex(branch["branchPubkey"]), node.chain_code
-
-
-def test_the_index_is_a_uint32(part2):
-    sk, pk, chain = _branch(part2)
-    for bad in [-1, 2**32, 1.5, True, "0"]:
-        with pytest.raises(ProtocolError):
-            derive_note_pubkey(pk, chain, bad)
-        with pytest.raises(ProtocolError):
-            derive_note_secret_key(sk, chain, bad)
-
-
-def test_a_tweak_at_or_above_n_is_reduced_mod_n(part2, monkeypatch):
-    # A ~2^-128 event nobody will meet, but the spec requires t mod n, and
-    # lnurl-wallet reduces it: 2^256 - 1 derives exactly what 2^256 - 1 - n does
-    sk, pk, chain = _branch(part2)
-    reduced = (2**256 - 1 - _CURVE_N).to_bytes(32, "big")
-    monkeypatch.setattr(recoverable, "sha256", lambda _data: _Digest(reduced))
-    want_pk, want_sk = derive_note_pubkey(pk, chain, 0), derive_note_secret_key(sk, chain, 0)
-    monkeypatch.setattr(recoverable, "sha256", lambda _data: _Digest(b"\xff" * 32))
-    assert derive_note_pubkey(pk, chain, 0) == want_pk
-    assert derive_note_secret_key(sk, chain, 0) == want_sk
-    assert PrivateKey(want_sk).public_key.format(compressed=True)[1:] == want_pk
-
-
-def test_a_tweak_that_lands_on_zero_is_refused(part2, monkeypatch):
-    # t = n - p puts the note key at zero and its point at infinity: the other
-    # way an index is unusable, and the same answer
-    sk, pk, chain = _branch(part2)
-    p = int.from_bytes(sk, "big")
-    even = PrivateKey(sk).public_key.format(compressed=True)[0] == 0x02
-    t = _CURVE_N - (p if even else _CURVE_N - p)
-    monkeypatch.setattr(recoverable, "sha256", lambda _data: _Digest(t.to_bytes(32, "big")))
-    with pytest.raises(ProtocolError, match="next index"):
-        derive_note_pubkey(pk, chain, 0)
-    with pytest.raises(ProtocolError, match="next index"):
-        derive_note_secret_key(sk, chain, 0)
-
-
-def test_a_branch_key_off_the_curve_is_refused(part2):
-    _, _, chain = _branch(part2)
+def test_a_legacy_branch_key_off_the_curve_is_refused(part2):
+    _, cx1 = _legacy_branch(part2)
     # x = 5 has no point on secp256k1
     with pytest.raises(ProtocolError):
-        derive_note_pubkey((5).to_bytes(32, "big"), chain, 0)
+        legacy_derive_note_pubkey(
+            LegacyCx1((5).to_bytes(32, "big"), cx1.chain_code), LEGACY_PURPOSE_WALLET, 0
+        )
 
 
-def test_a_bad_branch_private_key_is_refused(part2):
-    _, _, chain = _branch(part2)
+def test_a_bad_legacy_branch_private_key_is_refused(part2):
+    node, _ = _legacy_branch(part2)
     for bad in [bytes(32), _CURVE_N.to_bytes(32, "big"), bytes(31)]:
         with pytest.raises(ProtocolError):
-            derive_note_secret_key(bad, chain, 0)
+            legacy_derive_note_secret_key(
+                type(node)(bad, node.chain_code), LEGACY_PURPOSE_WALLET, 0
+            )
+
+
+def test_legacy_purposes_are_independent_counters_and_none_is_a_scheme_of_its_own(part2):
+    node, cx1 = _legacy_branch(part2)
+    keys = {
+        purpose: legacy_derive_note_pubkey(cx1, purpose, 0)
+        for purpose in (
+            LEGACY_PURPOSE_WALLET,
+            LEGACY_PURPOSE_CHANGE,
+            LEGACY_PURPOSE_LIGHTNING_ADDRESS,
+            None,
+        )
+    }
+    assert (LEGACY_PURPOSE_WALLET, LEGACY_PURPOSE_CHANGE, LEGACY_PURPOSE_LIGHTNING_ADDRESS) == (
+        0,
+        1,
+        2,
+    )
+    assert len(set(keys.values())) == 4
+    for purpose, key in keys.items():
+        secret = legacy_derive_note_secret_key(node, purpose, 0)
+        assert PrivateKey(secret).public_key_xonly.format() == key
+
+
+def test_the_legacy_purpose_is_a_uint32_too(part2):
+    node, cx1 = _legacy_branch(part2)
+    for bad in [-1, 2**32, 1.5, True, "0"]:
+        with pytest.raises(ProtocolError):
+            legacy_derive_note_pubkey(cx1, bad, 0)
+        with pytest.raises(ProtocolError):
+            legacy_derive_note_secret_key(node, bad, 0)
+
+
+def test_a_legacy_cx1_is_not_a_cx1(part2):
+    text = part2["legacy"]["branches"][0]["cx1"]
+    legacy = decode_legacy_cx1(text)
+    assert legacy is not None and encode_legacy_cx1(legacy) == text
+    assert decode_cx1(text) is None and not is_cx1(text)
+    assert decode_legacy_cx1(_share_cx1(part2)) is None
 
 
 # ---- ownership signatures ----
@@ -758,40 +949,14 @@ def test_a_nostr_seed_needs_a_32_byte_key():
 
 
 def test_a_cx1_round_trips(part2):
-    branch = part2["branches"][0]
-    cx1 = decode_cx1(branch["cx1"])
+    share = part2["branches"][0]["accounts"][0]["shares"][0]
+    cx1 = decode_cx1(share["cx1"])
     assert cx1 is not None
-    assert encode_cx1(cx1.pubkey_x_only, cx1.chain_code) == branch["cx1"]
-    assert encode_cp1(derive_note_pubkey(cx1.pubkey_x_only, cx1.chain_code, 0)) == (
-        branch["notes"][0]["cp1"]
-    )
+    assert encode_cx1(cx1) == share["cx1"]
+    assert encode_cp1(derive_note_pubkey(cx1, 0)) == share["notes"][0]["cp1"]
 
 
-# ---- the purpose input to the tweak, and the sig -> c rename ----
-
-
-def test_purposes_are_independent_counters(part2):
-    sk, pk, chain = _branch(part2)
-    keys = {
-        purpose: derive_note_pubkey(pk, chain, 0, purpose)
-        for purpose in (PURPOSE_WALLET, PURPOSE_CHANGE, PURPOSE_LIGHTNING_ADDRESS)
-    }
-    assert (PURPOSE_WALLET, PURPOSE_CHANGE, PURPOSE_LIGHTNING_ADDRESS) == (0, 1, 2)
-    assert len(set(keys.values())) == 3
-    # the default is the wallet purpose
-    assert derive_note_pubkey(pk, chain, 0) == keys[PURPOSE_WALLET]
-    for purpose, key in keys.items():
-        secret = derive_note_secret_key(sk, chain, 0, purpose)
-        assert PrivateKey(secret).public_key_xonly.format() == key
-
-
-def test_the_purpose_is_a_uint32_too(part2):
-    sk, pk, chain = _branch(part2)
-    for bad in [-1, 2**32, 1.5, True, "0"]:
-        with pytest.raises(ProtocolError):
-            derive_note_pubkey(pk, chain, 0, bad)
-        with pytest.raises(ProtocolError):
-            derive_note_secret_key(sk, chain, 0, bad)
+# ---- the sig -> c rename ----
 
 
 def test_the_legacy_sig_names_are_still_read_and_c_wins(notes, cert):

@@ -22,10 +22,10 @@ from lnurlcash_kit.protocol import (
 )
 from lnurlcash_kit import (
     NOSTR_CASH_SEED_LABEL,
+    NotePath,
     AmbiguousMint,
     Certification,
     Cs1,
-    Cx1,
     LnurlcashClient,
     LnurlcashError,
     MintFee,
@@ -46,15 +46,16 @@ from lnurlcash_kit import (
     decode_cs1,
     decode_cs1_with_amount,
     decode_cx1,
-    derive_cash_address_node,
     derive_cash_child,
     derive_cash_domain_node,
     derive_cash_root,
+    derive_note_key,
     derive_note_pubkey,
+    derive_service_root,
+    derive_share_node,
+    derive_nostr_service_root,
     derive_note_root,
     derive_note_secret,
-    derive_note_secret_key,
-    derive_nostr_address_node,
     derive_nostr_cash_seed,
     encode_ck1,
     encode_cp1,
@@ -74,7 +75,17 @@ from lnurlcash_kit import (
     recover_note_ownership_pubkey,
     sign_note_ownership,
     sign_address_proof,
-    verify_note_signature_for_key,
+    verify_address_proof,
+    verify_legacy_note_signature_hash,
+    check_note_certificate,
+    decode_legacy_cx1,
+    encode_legacy_cx1,
+    legacy_branch_node,
+    legacy_cx1_of,
+    legacy_derive_note_pubkey,
+    legacy_derive_note_secret_key,
+    legacy_note_signature_digest_for_hash,
+    legacy_note_signature_message_for_hash,
     verify_note_signature_hash,
     verify_note_url,
     verify_spend,
@@ -130,26 +141,36 @@ def _nested(name: str, key: str, inner: str):
 # ---- signatures ----
 
 
-# signature.json predates every note being keyed by Q: each case certifies a
-# bearer note over its h, the message a mint used before taproot. That is
-# exactly LUD-25's fallback, so a valid case must verify as it and nothing
-# more.
+# signature.json predates notes keyed by Q: every certificate there is over a
+# bearer note's hash h, with no domain, the message a mint signed before LUD-25
+# moved certificates onto hex(Q) at the mint's domain. The verdicts still hold
+# through the legacy reading, reported as such; the message a current mint
+# signs for the same note is over its domain and Q instead.
 
 
 @pytest.mark.parametrize("case", _cases("signature.json", "cases"), ids=lambda c: c["name"])
 def test_signature_verification(case):
     want = Certification.CERTIFIED_OVER_HASH if case["valid"] else Certification.NOT_CERTIFIED
+    # a bearer preimage opens its note anywhere, so the domain is moot
     got = verify_note_signature(
         case["k1"], "mint.example", case["amountMsat"], case["signature"], case["mintPubkey"]
     )
     assert got is want
     assert bool(got) is case["valid"]
-    if is_preimage(case["k1"]):
-        h = hash_k1(case["k1"])
+    if case["valid"]:
         assert (
-            verify_note_signature_hash(h, case["amountMsat"], case["signature"], case["mintPubkey"])
-            is want
+            check_note_certificate(
+                case["noteId"], "mint.example", case["amountMsat"], case["signature"], case["mintPubkey"]
+            )
+            is Certification.CERTIFIED_OVER_HASH
         )
+        assert verify_legacy_note_signature_hash(
+            case["noteId"], case["amountMsat"], case["signature"], case["mintPubkey"]
+        )
+    # and never a current certificate
+    assert not verify_note_signature_hash(
+        case["noteId"], "mint.example", case["amountMsat"], case["signature"], case["mintPubkey"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -160,14 +181,18 @@ def test_signature_verification(case):
 def test_signature_digest_derivation(case):
     # the pre-taproot message, over h
     h = hash_k1(case["k1"])
-    assert note_signature_message_for_hash(h, case["amountMsat"]) == case["message"]
-    assert note_signature_digest_for_hash(h, case["amountMsat"]).hex() == case["digest"]
-    # and the message a current mint signs names the note by hex(Q)
+    assert legacy_note_signature_message_for_hash(h, case["amountMsat"]) == case["message"]
+    assert legacy_note_signature_digest_for_hash(h, case["amountMsat"]).hex() == case["digest"]
+    # and the message a current mint signs names the note by hex(Q) at its domain
     q = bearer_note_id(h)
-    assert note_signature_message(case["k1"], case["amountMsat"]) == f"LNURLcash:{case['amountMsat']}:{q}"
-    assert note_signature_digest(case["k1"], case["amountMsat"]) == note_signature_digest_for_hash(
-        q, case["amountMsat"]
+    assert q != h
+    assert (
+        note_signature_message(case["k1"], "mint.example", case["amountMsat"])
+        == f"LNURLcash:mint.example:{case['amountMsat']}:{q}"
     )
+    assert note_signature_digest(
+        case["k1"], "mint.example", case["amountMsat"]
+    ) == note_signature_digest_for_hash(q, "mint.example", case["amountMsat"])
 
 
 # ---- response classification ----
@@ -459,7 +484,13 @@ def test_without_k1(case):
 
 
 def _fee(raw: dict) -> MintFee:
-    return MintFee(base_fee_msat=raw["baseFeeMsat"], fee_ppm=raw["feePpm"])
+    # addressFeeMsat is absent from the apply and grossUp cases, which do not
+    # use it
+    return MintFee(
+        base_fee_msat=raw["baseFeeMsat"],
+        fee_ppm=raw["feePpm"],
+        address_fee_msat=raw.get("addressFeeMsat"),
+    )
 
 
 @pytest.mark.parametrize("case", _cases("fees.json", "parse"))
@@ -681,14 +712,15 @@ def test_legacy_derivation(case):
     assert hash_k1(k1) == case["noteId"]
 
 
+
+
 # ---- key-path notes ----
 #
-# part2.json: notes whose output key is a holder's own key, spent by a ck1
-# bound to the mint's domain. Every field of every branch, note and
-# certificate is bound to the library here, including verifying each ck1
-# against its note key at its domain and recovering each cs1 to the mint's.
-# A disagreement is a note one implementation mints and another cannot find,
-# or cannot spend.
+# part2.json pins LUD-26's tree below each SERVICE root, each key's key-path
+# spend for its domain, share cx1s, address proofs, mint certificates, the
+# superseded tweak schemes and the bech32m strings. Every field is graded on
+# every branch and note: a wallet that disagrees with one of them cannot find,
+# spend or check a note that another implementation of the same seed made.
 
 _PART2 = "part2.json"
 _HARDENED = 0x80000000
@@ -700,7 +732,9 @@ _PART2_DECODERS = {
         if (certificate := decode_cs1_with_amount(value)) is not None
         else None
     ),
-    "cx1": decode_cx1,
+    "cx1": lambda value: (
+        cx1.chain_code + cx1.pubkey if (cx1 := decode_cx1(value)) is not None else None
+    ),
 }
 _PART2_TESTS = {
     "cp1": is_cp1,
@@ -726,171 +760,187 @@ def _branch_id(branch: dict) -> str:
     return f"{branch['mnemonic'].split()[0]}/{branch['host']}"
 
 
-def _part2_notes() -> list[tuple[dict, dict]]:
-    return [(b, n) for b in _cases(_PART2, "branches") for n in b["notes"]]
+def _all_notes(accounts: list[dict]) -> list[dict]:
+    notes: list[dict] = []
+    for account in accounts:
+        notes += account["wallet"] + account["change"]
+        for share in account["shares"]:
+            notes += share["notes"]
+    return notes
 
 
-def test_part2_conventions_are_the_ones_this_library_implements():
-    conventions = load_vectors(_PART2)["conventions"]
-    # the spec text's literal path: the address branch is the domain node
-    assert conventions["addressBranch"] == "m/139'/d1/d2/d3/d4"
-    assert conventions["hashingKey"] == "m/139'/0"
-    assert conventions["spendDomain"].startswith("the host's lowercase hostname")
-    assert conventions["ck1Signs"].startswith('tagged_hash("TapSighash", 0x00 || SigMsg)')
-    assert conventions["keyPathSignature"].startswith("BIP-340 Schnorr, 64 bytes, all-zero aux_rand")
-    assert conventions["ck1Payload"] == "32-byte x-only public key || 64-byte Schnorr signature"
-    assert conventions["addressProofMessage"] == "LNURLcash:<register|unregister>:<domain>:<username>"
-    assert conventions["addressProofMessageEncoding"].startswith("UTF-8 bytes, sha256-hashed")
-    assert conventions["certificateMessage"] == "LNURLcash:<amount_msat>:<hex(pk)>"
-    assert conventions["certificateHrp"] == "cs || BOLT11_amount_suffix(amount_msat)"
-    assert conventions["indexWidth"].startswith("4 bytes, big-endian")
-    # the sighash itself is bound in test_part2_note, by reproducing every
-    # vector's sighash and signature
+def _x_only(secret_key: bytes) -> str:
+    return PrivateKey(secret_key).public_key_xonly.format().hex()
 
 
-@pytest.mark.parametrize(
-    "proof",
-    _cases(_PART2, "addressProofs"),
-    ids=lambda p: f"{p['action']}/{p['domain']}/{p['username']}",
-)
-def test_address_proof(proof):
-    action, domain, username = proof["action"], proof["domain"], proof["username"]
-    # the mint's own domain, however the caller happens to spell it
-    for spelling in (domain, domain.upper(), f"https://{domain}/w"):
-        assert address_proof_message(action, spelling, username) == proof["message"]
-    message = proof["message"]
-    digest = address_proof_digest(action, domain, username)
-    assert digest.hex() == proof["digest"]
-    assert digest == hashlib.sha256(message.encode("utf-8")).digest()
-    key = bytes.fromhex(proof["indexZeroSecretKey"])
-    signature = sign_address_proof(key, action, domain, username)
-    assert signature.hex() == proof["signature"]
-    assert PublicKeyXOnly(bytes.fromhex(proof["indexZeroPubkey"])).verify(signature, digest)
-    # a proof for one mint is no proof at another
-    assert sign_address_proof(key, action, "elsewhere.example", username) != signature
-
-
-def test_address_proofs_cover_more_than_one_mint():
-    assert len({p["domain"] for p in _cases(_PART2, "addressProofs")}) >= 2
-
-
-def test_address_proof_rejects_unknown_action_and_no_mint():
-    with pytest.raises(ProtocolError):
-        address_proof_message("delete", "mint.example", "alice")
-    with pytest.raises(ProtocolError):
-        address_proof_digest("delete", "mint.example", "alice")
-    with pytest.raises(ProtocolError):
-        address_proof_message("register", "", "alice")
-
-
-def test_part2_covers_both_branch_parities_and_the_whole_index_range():
-    # an odd-parity branch is the only thing that exercises the negation in
-    # derive_note_secret_key, and 2^31 and 2^32 - 1 are where an
-    # implementation that hardens or narrows the index shows itself
-    branches = load_vectors(_PART2)["branches"]
-    assert {b["branchParity"] for b in branches} == {"even", "odd"}
-    for branch in branches:
-        indices = [n["index"] for n in branch["notes"]]
-        assert _HARDENED in indices and 0xFFFFFFFF in indices
-
-
-@pytest.mark.parametrize("branch", _cases(_PART2, "branches"), ids=_branch_id)
-def test_part2_branch(branch):
-    seed = _bip39_seed(branch["mnemonic"])
-    assert seed.hex() == branch["seedHex"]
-    root = derive_cash_root(seed)
-    assert cash_node_to_hex(root) == branch["cashRoot"]
-
-    # the hashing key is m/139'/0, so the four levels hang off the root itself
-    assert list(cash_domain_indices(root, branch["host"])) == branch["domainIndices"]
-    # the derivation hashes the host as stored; a spend binds its hostname
-    assert spend_domain_of(branch["host"]) == branch["domain"]
-
-    node = derive_cash_address_node(root, branch["host"])
-    assert cash_node_to_hex(node) == branch["addressNode"]
-    assert cash_node_to_hex(node) == cash_node_to_hex(
-        derive_cash_domain_node(root, branch["host"])
-    )
-
-    cx1 = cash_node_to_cx1(node)
-    assert cx1.pubkey_x_only.hex() == branch["branchPubkey"]
-    assert cx1.chain_code.hex() == branch["chainCode"]
-    prefix = PrivateKey(node.private_key).public_key.format(compressed=True)[0]
-    assert ("even" if prefix == 0x02 else "odd") == branch["branchParity"]
-    assert encode_cx1(cx1.pubkey_x_only, cx1.chain_code) == branch["cx1"]
-    assert decode_cx1(branch["cx1"]) == cx1
-    assert is_cx1(branch["cx1"])
-
-
-@pytest.mark.parametrize(
-    "branch,note",
-    _part2_notes(),
-    ids=lambda v: _branch_id(v) if "mnemonic" in v else f"#{v['index']}",
-)
-def test_part2_note(branch, note):
-    index, purpose = note["index"], note["purpose"]
-    node = cash_node_from_hex(branch["addressNode"])
-
-    # the watcher's half, from nothing but the cx1
-    watched = decode_cx1(branch["cx1"])
-    assert watched is not None
-    pk = derive_note_pubkey(watched.pubkey_x_only, watched.chain_code, index, purpose)
-    assert pk.hex() == note["notePubkey"]
-
-    # the holder's half, and that it is the key the watcher derived
-    sk = derive_note_secret_key(node.private_key, node.chain_code, index, purpose)
-    assert sk.hex() == note["noteSecretKey"]
-    assert PrivateKey(sk).public_key.format(compressed=True)[1:] == pk
-
-    assert encode_cp1(pk) == note["cp1"]
-    assert decode_cp1(note["cp1"]) == pk
-
-    _grade_key_path_note(sk, pk, note, branch["domain"])
-
-
-def _grade_key_path_note(sk: bytes, pk: bytes, note: dict, domain: str) -> None:
-    # the key-path sighash for this note at this mint
-    assert key_path_sighash(pk, domain).hex() == note["sighash"]
-
-    # Fixed all-zero BIP-340 auxiliary input, so re-deriving the key
-    # reproduces the ck1 byte for byte for seed recovery
-    payload = sign_note_ownership(sk, domain)
-    assert payload[:32] == pk
-    assert payload[32:].hex() == note["keyPathSignature"]
-    assert encode_ck1(payload) == note["ck1"]
-    assert decode_ck1(note["ck1"]) == payload
+def _grade_key_path_note(note: dict, secret: bytes, host: str, domain: str, at: str) -> None:
+    """One key-path note's spend fields, as part2.json and nostr-seed.json both
+    carry them: the sighash for its domain, the signature, the ck1, and what
+    the SERVICE makes of it there and elsewhere."""
+    pubkey = bytes.fromhex(note["notePubkey"])
+    assert key_path_sighash(pubkey, domain).hex() == note["sighash"], at
+    # Fixed BIP-340 auxiliary input: the same key reproduces the same ck1 for
+    # the same domain byte for byte, for seed recovery. Signing from the host
+    # as stored reduces it to the domain first.
+    payload = sign_note_ownership(secret, host)
+    assert payload[:32] == pubkey, at
+    assert payload[32:].hex() == note["keyPathSignature"], at
+    assert encode_ck1(payload) == note["ck1"], at
+    assert decode_ck1(note["ck1"]) == payload, at
 
     # Verified twice: through the library, and straight off the vector's own
     # sighash, which pins exactly what the library signs over.
     owner = recover_note_ownership_pubkey(payload, domain)
-    assert owner is not None and owner.pubkey_x_only == pk and not owner.legacy
-    assert PublicKeyXOnly(pk).verify(payload[32:], bytes.fromhex(note["sighash"]))
+    assert owner is not None and owner.pubkey_x_only == pubkey and not owner.legacy, at
+    assert PublicKeyXOnly(pubkey).verify(payload[32:], bytes.fromhex(note["sighash"])), at
     verified = verify_spend(note["ck1"], domain)
-    assert verified is not None and verified.output_key == pk and not verified.legacy
+    assert verified is not None and verified.output_key == pubkey and not verified.legacy, at
     # and it is bound to that mint: anywhere else it opens nothing
-    assert verify_spend(note["ck1"], "elsewhere." + domain) is None
+    assert verify_spend(note["ck1"], "elsewhere.example") is None, at
 
-    assert note_id_of(note["ck1"]) == note["notePubkey"]
-    assert note_id_of(note["ck1"].upper()) == note["notePubkey"]
-    assert note_lookup_of(note["ck1"]) == note["cp1"]
+    assert note_id_of(note["ck1"]) == note["notePubkey"], at
+    assert note_id_of(note["ck1"].upper()) == note["notePubkey"], at
+    assert note_lookup_of(note["ck1"]) == note["cp1"], at
+
+
+def _grade_note(service_root, path: NotePath, note: dict, host: str, domain: str, at: str):
+    """One note's keys, derived from the SERVICE root at ``path``, and its spend."""
+    key = derive_note_key(service_root, path)
+    assert key.secret_key.hex() == note["noteSecretKey"], at
+    assert key.pubkey.hex() == note["notePubkeyCompressed"], at
+    assert key.output_key.hex() == note["notePubkey"], at
+    # x(sk . G) == Q, the round trip the spec calls out
+    assert _x_only(key.secret_key) == note["notePubkey"], at
+    assert encode_cp1(key.output_key) == note["cp1"], at
+    assert decode_cp1(note["cp1"]) == key.output_key, at
+    _grade_key_path_note(note, key.secret_key, host, domain, at)
+
+
+def _grade_accounts(service_root, accounts: list[dict], host: str, domain: str, at: str) -> None:
+    """Every account as part2.json and nostr-seed.json carry them: each wallet
+    and change note from the root, each share's cx1, and each share note both
+    from the root and, as a SERVICE derives it, from the cx1 alone."""
+    for account in accounts:
+        a = account["account"]
+        for chain, make in (("wallet", NotePath.wallet), ("change", NotePath.change)):
+            for note in account[chain]:
+                index = note["index"]
+                _grade_note(
+                    service_root,
+                    make(a, index),
+                    note,
+                    host,
+                    domain,
+                    f"{at} {a}'/{chain}/{index}",
+                )
+        for share in account["shares"]:
+            n = share["share"]
+            where = f"{at} {a}'/2/{n}'"
+            node = derive_share_node(service_root, a, n)
+            assert node.private_key.hex() == share["sharePrivateKey"], where
+            assert node.chain_code.hex() == share["chainCode"], where
+            cx1 = cash_node_to_cx1(node)
+            assert cx1.pubkey.hex() == share["sharePubkey"], where
+            assert encode_cx1(cx1) == share["cx1"], where
+            assert len(share["cx1"]) == 113, where
+            # a SERVICE starts from the string, never the node
+            watched = decode_cx1(share["cx1"])
+            assert watched == cx1, where
+            for note in share["notes"]:
+                index = note["index"]
+                _grade_note(
+                    service_root,
+                    NotePath.for_share(a, n, index),
+                    note,
+                    host,
+                    domain,
+                    f"{where}/{index}",
+                )
+                assert derive_note_pubkey(watched, index).hex() == note["notePubkey"], (
+                    f"{where}/{index}: CKDpub from the cx1"
+                )
+
+
+def test_part2_conventions_are_the_ones_this_library_implements():
+    conventions = load_vectors(_PART2)["conventions"]
+    assert conventions["serviceRoot"] == "m/139'/d1/d2/d3/d4"
+    assert conventions["hashingKey"] == "m/139'/0"
+    assert conventions["walletChain"] == "S/a'/0/i"
+    assert conventions["changeChain"] == "S/a'/1/i"
+    assert conventions["shareNote"] == "S/a'/2/n'/i"
+    assert conventions["spendDomain"].startswith("the host's lowercase name")
+    assert conventions["ck1Signs"].startswith('tagged_hash("TapSighash", 0x00 || SigMsg)')
+    assert conventions["keyPathSignature"].startswith("BIP-340 Schnorr, 64 bytes, all-zero aux_rand")
+    assert conventions["ck1Payload"] == "32-byte x-only public key || 64-byte Schnorr signature"
+    assert conventions["cx1Payload"].startswith("chainCode (32) || P (33, compressed)")
+    assert conventions["addressProofMessages"] == {
+        "register": "LNURLcash:register:<domain>:<username>:<cx1>",
+        "update": "LNURLcash:update:<domain>:<username>:<new cx1>",
+        "unregister": "LNURLcash:unregister:<domain>:<username>",
+    }
+    assert conventions["certificateMessage"] == "LNURLcash:<domain>:<amount_msat>:<hex(Q)>"
+    assert conventions["certificateHrp"] == "cs || BOLT11_amount_suffix(amount_msat)"
+    # the sighash itself is bound in _grade_key_path_note, by reproducing every
+    # vector's sighash and signature
+
+
+def test_part2_covers_both_parities_the_largest_index_and_a_host_with_a_port():
+    branches = load_vectors(_PART2)["branches"]
+    notes = [n for b in branches for n in _all_notes(b["accounts"])]
+    # both parities exercise the BIP-340 signer's negation, and 2^31 - 1 is the
+    # largest index that is not a hardened step
+    assert any(n["notePubkeyCompressed"].startswith("02") for n in notes)
+    assert any(n["notePubkeyCompressed"].startswith("03") for n in notes)
+    assert any(n["index"] == 0x7FFFFFFF for n in notes)
+    # where the host as stored and the domain part company
+    assert any(b["host"] != b["domain"] for b in branches)
+
+
+@pytest.mark.parametrize("branch", _cases(_PART2, "branches"), ids=_branch_id)
+def test_part2_branch(branch):
+    host, domain = branch["host"], branch["domain"]
+    assert spend_domain_of(host) == domain
+    seed = _bip39_seed(branch["mnemonic"])
+    assert seed.hex() == branch["seedHex"]
+    root = derive_cash_root(seed)
+    # the hashing key is m/139'/0, so the four levels hang off the root itself
+    assert derive_cash_child(root, 0).private_key.hex() == branch["cashHashingKey"]
+    assert list(cash_domain_indices(root, domain)) == branch["domainIndices"]
+    # from the host as stored, which drops its port first
+    service_root = derive_service_root(root, host)
+    assert cash_node_to_hex(service_root) == branch["serviceRoot"]
+    _grade_accounts(service_root, branch["accounts"], host, domain, host)
 
 
 @pytest.mark.parametrize(
-    "cert", _cases(_PART2, "certificates"), ids=lambda c: f"{c['amountMsat']}msat"
+    "cert", _cases(_PART2, "certificates"), ids=lambda c: f"{c['amountMsat']}msat@{c['domain']}"
 )
 def test_part2_certificate(cert):
     vectors = load_vectors(_PART2)
     mint = vectors["mint"]
+    mint_pubkey = mint["mintPubkey"]
     mint_key = PrivateKey(bytes.fromhex(mint["privateKey"]))
-    assert mint_key.public_key.format(compressed=True).hex() == mint["mintPubkey"]
+    assert mint_key.public_key.format(compressed=True).hex() == mint_pubkey
 
-    note_pubkey, amount = cert["notePubkey"], cert["amountMsat"]
-    assert note_signature_message_for_hash(note_pubkey, amount) == cert["message"]
-    digest = note_signature_digest_for_hash(note_pubkey, amount)
+    # Every note in the file by key, so each certificate is checked the way a
+    # recipient checks one: from the note's ck1 and its domain, nothing else.
+    ck1_of = {
+        n["notePubkey"]: (n["ck1"], b["domain"])
+        for b in vectors["branches"]
+        for n in _all_notes(b["accounts"])
+    }
+
+    pubkey, domain, amount = cert["notePubkey"], cert["domain"], cert["amountMsat"]
+    assert note_signature_message_for_hash(pubkey, domain, amount) == cert["message"]
+    digest = note_signature_digest_for_hash(pubkey, domain, amount)
     assert digest.hex() == cert["digest"]
+    ck1, note_domain = ck1_of[pubkey]
+    assert note_signature_message(ck1, domain, amount) == cert["message"]
+    assert note_signature_digest(ck1, domain, amount) == digest
 
     signature = bytes.fromhex(cert["signature"])
-    # the mint's side is as deterministic as the holder's
+    # RFC6979 on the mint's side too: its key over the digest reproduces the
+    # certificate
     assert mint_key.sign_recoverable(digest, hasher=None) == signature
     assert encode_cs1_with_amount(amount, signature) == cert["cs1"]
     assert decode_cs1_with_amount(cert["cs1"]) == Cs1(amount, signature)
@@ -900,40 +950,194 @@ def test_part2_certificate(cert):
     assert is_any_cs1(cert["cs1"])
 
     legacy = encode_cs1(signature)
-    assert decode_cs1(legacy) == signature
-    assert is_cs1(legacy)
-    assert decode_cs1_with_amount(legacy) is None
-    assert not is_cs1_with_amount(legacy)
-    assert decode_any_cs1(legacy) == signature
-    assert is_any_cs1(legacy)
+    assert decode_cs1(legacy) == signature and is_cs1(legacy)
+    assert decode_cs1_with_amount(legacy) is None and not is_cs1_with_amount(legacy)
+    assert decode_any_cs1(legacy) == signature and is_any_cs1(legacy)
     recovered = PublicKey.from_signature_and_message(signature, digest, hasher=None)
-    assert recovered.format(compressed=True).hex() == mint["mintPubkey"]
+    assert recovered.format(compressed=True).hex() == mint_pubkey
 
-    # a watcher's check, holding only the key, in either spelling
-    for spelling in (cert["cs1"], cert["signature"]):
-        assert (
-            verify_note_signature_for_key(note_pubkey, amount, spelling, mint["mintPubkey"])
-            is Certification.CERTIFIED_OVER_Q
-        )
-
-    # and a recipient's, holding the ck1 and its mint's domain, offline
-    ck1, domain = next(
-        (n["ck1"], b["domain"])
-        for b in vectors["branches"]
-        for n in b["notes"]
-        if n["notePubkey"] == note_pubkey
-    )
-    assert note_signature_message(ck1, amount) == cert["message"]
-    assert note_signature_digest(ck1, amount).hex() == cert["digest"]
+    # Recovers to the mint's key by the note's id at the certificate's domain,
+    # and nowhere else. A current certificate is a cs1, never raw hex.
+    assert verify_note_signature_hash(pubkey, domain, amount, cert["cs1"], mint_pubkey)
+    assert not verify_note_signature_hash(pubkey, domain, amount, cert["signature"], mint_pubkey)
+    assert not verify_note_signature_hash(pubkey, "elsewhere.example", amount, cert["cs1"], mint_pubkey)
+    cp1 = encode_cp1(bytes.fromhex(pubkey))
     assert (
-        verify_note_signature(ck1, domain, amount, cert["cs1"], mint["mintPubkey"])
+        check_note_certificate(cp1, domain, amount, cert["cs1"], mint_pubkey)
         is Certification.CERTIFIED_OVER_Q
     )
-    assert not verify_note_signature(ck1, domain, amount + 1, cert["cs1"], mint["mintPubkey"])
-    # the certificate is sound, but the spend does not open the note there
-    assert not verify_note_signature(
-        ck1, "elsewhere." + domain, amount, cert["cs1"], mint["mintPubkey"]
+    assert not check_note_certificate(cp1, "elsewhere.example", amount, cert["cs1"], mint_pubkey)
+
+    # A certificate for another domain than the note's own vouches for nothing
+    # there.
+    if domain != note_domain:
+        assert not verify_note_signature(ck1, note_domain, amount, cert["cs1"], mint_pubkey)
+        return
+    assert (
+        verify_note_signature(ck1, domain, amount, cert["cs1"], mint_pubkey)
+        is Certification.CERTIFIED_OVER_Q
     )
+    # ...and to nothing it does not cover
+    assert not verify_note_signature(ck1, domain, amount + 1, cert["cs1"], mint_pubkey)
+    other, other_domain = next(v for k, v in ck1_of.items() if k != pubkey)
+    assert not verify_note_signature(other, other_domain, amount, cert["cs1"], mint_pubkey)
+    # A cs1 whose prefix states another amount than the one it signs proves
+    # nothing, whichever amount is asked about.
+    relabelled = encode_cs1_with_amount(amount + 1000, signature)
+    assert not verify_note_signature_hash(pubkey, domain, amount, relabelled, mint_pubkey)
+    assert not verify_note_signature_hash(pubkey, domain, amount + 1000, relabelled, mint_pubkey)
+
+    # The certificate is public, and so is Q. A ck1 pairing them with a
+    # signature that does not open the note must not pass as the note, however
+    # good the certificate; and the genuine ck1 is refused at any other mint.
+    forged = bytearray(decode_ck1(ck1))
+    forged[40] ^= 0x01
+    assert not verify_note_signature(
+        encode_ck1(bytes(forged)), domain, amount, cert["cs1"], mint_pubkey
+    )
+    assert not verify_note_signature(ck1, "elsewhere.example", amount, cert["cs1"], mint_pubkey)
+
+
+def test_part2_legacy_certificates_are_read_and_reported_as_legacy():
+    vectors = load_vectors(_PART2)
+    mint_pubkey = vectors["mint"]["mintPubkey"]
+    ck1_of = {
+        n["notePubkey"]: (n["ck1"], b["domain"])
+        for b in vectors["branches"]
+        for n in _all_notes(b["accounts"])
+    }
+    legacy = vectors["legacyCertificates"]
+    assert legacy
+    for cert in legacy:
+        pubkey, amount, cs1 = cert["notePubkey"], cert["amountMsat"], cert["cs1"]
+        assert legacy_note_signature_message_for_hash(pubkey, amount) == cert["message"]
+        assert legacy_note_signature_digest_for_hash(pubkey, amount).hex() == cert["digest"]
+        assert verify_legacy_note_signature_hash(pubkey, amount, cs1, mint_pubkey)
+        # ...and never as the current one
+        assert not verify_note_signature_hash(pubkey, "mint.example", amount, cs1, mint_pubkey)
+        ck1, domain = ck1_of[pubkey]
+        assert (
+            verify_note_signature(ck1, domain, amount, cs1, mint_pubkey)
+            is Certification.CERTIFIED_OVER_LEGACY_Q
+        )
+        # raw hex is a legacy spelling too
+        assert verify_legacy_note_signature_hash(pubkey, amount, cert["signature"], mint_pubkey)
+
+
+@pytest.mark.parametrize(
+    "proof",
+    _cases(_PART2, "addressProofs"),
+    ids=lambda p: f"{p.get('role', p['action'])}/{p['domain']}/{p['username']}",
+)
+def test_address_proof(proof):
+    vectors = load_vectors(_PART2)
+    share_key = {
+        s["cx1"]: bytes.fromhex(s["sharePrivateKey"])
+        for b in vectors["branches"]
+        for a in b["accounts"]
+        for s in a["shares"]
+    }
+    action, domain, username = proof["action"], proof["domain"], proof["username"]
+    cx1, signer = proof.get("cx1"), proof["signerCx1"]
+    secret = share_key[signer]
+    assert _x_only(secret) == proof["signerPubkey"]
+    # the mint's own domain, however the caller happens to spell it
+    for spelling in (domain, domain.upper(), f"https://{domain}/w"):
+        assert address_proof_message(action, spelling, username, cx1) == proof["message"]
+    digest = address_proof_digest(action, domain, username, cx1)
+    assert digest.hex() == proof["digest"]
+    assert digest == hashlib.sha256(proof["message"].encode("utf-8")).digest()
+    signature = sign_address_proof(secret, action, domain, username, cx1)
+    assert signature.hex() == proof["signature"]
+
+    # what the SERVICE checks: BIP-340 against x(P) of the signer's cx1
+    assert verify_address_proof(signer, signature, action, domain, username, cx1)
+    # bound to its domain, its signer and, where there is one, its cx1
+    assert not verify_address_proof(
+        signer, signature, action, "elsewhere.example", username, cx1
+    )
+    other = next(key for key in share_key if key not in (signer, cx1))
+    assert not verify_address_proof(other, signature, action, domain, username, cx1)
+    if cx1 is not None:
+        assert not verify_address_proof(signer, signature, action, domain, username, other)
+
+
+def test_address_proofs_cover_register_update_unregister_and_more_than_one_mint():
+    proofs = _cases(_PART2, "addressProofs")
+    assert {p["action"] for p in proofs} == {"register", "update", "unregister"}
+    assert len({p["domain"] for p in proofs}) >= 2
+    # a username is signed in lowercase
+    assert any(p["username"] != p["username"].lower() for p in proofs)
+
+
+def test_address_proof_refuses_what_it_cannot_bind():
+    vectors = load_vectors(_PART2)
+    cx1 = vectors["branches"][0]["accounts"][0]["shares"][0]["cx1"]
+    legacy_cx1 = vectors["legacy"]["branches"][0]["cx1"]
+    for action, bound in (
+        ("register", None),
+        ("update", None),
+        ("unregister", cx1),
+        ("delete", cx1),
+        ("register", legacy_cx1),
+        ("register", "not a cx1"),
+    ):
+        with pytest.raises(ProtocolError):
+            address_proof_message(action, "mint.example", "alice", bound)
+        with pytest.raises(ProtocolError):
+            address_proof_digest(action, "mint.example", "alice", bound)
+    with pytest.raises(ProtocolError):
+        address_proof_message("register", "", "alice", cx1)
+    with pytest.raises(ProtocolError):
+        address_proof_message("unregister", "mint.example", " ", None)
+    with pytest.raises(ProtocolError):
+        sign_address_proof(bytes(32), "unregister", "mint.example", "alice")
+    # a verifier never raises: malformed is simply not verified
+    assert not verify_address_proof("not a cx1", bytes(64), "unregister", "mint.example", "alice")
+    assert not verify_address_proof(cx1, b"short", "unregister", "mint.example", "alice")
+    assert not verify_address_proof(cx1, bytes(64), "delete", "mint.example", "alice")
+    assert not verify_address_proof(cx1, None, "unregister", "mint.example", "alice")
+
+
+def _legacy_seed(branch: dict) -> bytes:
+    return _bip39_seed(branch["mnemonic"])
+
+
+def test_legacy_tweak_vectors():
+    """The tweak schemes before LUD-26, kept so a wallet can find and sweep the
+    notes it holds under them."""
+    legacy = load_vectors(_PART2)["legacy"]
+    assert legacy["superseded"] is True
+    branches = legacy["branches"]
+    assert any(b["branchParity"] == "odd" for b in branches)
+    assert any(b["branchParity"] == "even" for b in branches)
+
+    for branch in branches:
+        host = branch["host"]
+        root = derive_cash_root(_legacy_seed(branch))
+        node = legacy_branch_node(root, host)
+        assert cash_node_to_hex(node) == branch["addressNode"], host
+        prefix = PrivateKey(node.private_key).public_key.format(compressed=True)[0]
+        assert ("even" if prefix == 0x02 else "odd") == branch["branchParity"], host
+        cx1 = legacy_cx1_of(node)
+        assert cx1.pubkey_x_only.hex() == branch["branchPubkey"], host
+        assert cx1.chain_code.hex() == branch["chainCode"], host
+        assert encode_legacy_cx1(cx1) == branch["cx1"], host
+        assert decode_legacy_cx1(branch["cx1"]) == cx1, host
+        assert decode_cx1(branch["cx1"]) is None, f"{host}: no longer a cx1"
+
+        notes = [(n["purpose"], n) for n in branch["notes"]]
+        notes += [(None, n) for n in branch["prePurpose"]]
+        assert {purpose for purpose, _ in notes} >= {None, 0, 1, 2}
+        for purpose, note in notes:
+            index = note["index"]
+            at = f"{host} {purpose}/{index}"
+            pk = legacy_derive_note_pubkey(cx1, purpose, index)
+            assert pk.hex() == note["notePubkey"], at
+            assert encode_cp1(pk) == note["cp1"], at
+            sk = legacy_derive_note_secret_key(node, purpose, index)
+            assert sk.hex() == note["noteSecretKey"], at
+            assert _x_only(sk) == note["notePubkey"], at
 
 
 @pytest.mark.parametrize(
@@ -941,8 +1145,6 @@ def test_part2_certificate(cert):
 )
 def test_part2_accepts(case):
     decoded = _PART2_DECODERS[case["type"]](case["value"])
-    if isinstance(decoded, Cx1):
-        decoded = decoded.pubkey_x_only + decoded.chain_code
     assert decoded is not None and decoded.hex() == case["bytes"]
     assert _PART2_TESTS[case["type"]](case["value"]) is True
 
@@ -958,9 +1160,9 @@ def test_part2_refuses(case):
 
 # ---- a Part 2 branch rooted in a Nostr key ----
 #
-# nostr-seed.json is an extension, not LUD-25, and says so. heartwood-esp32
-# derives the same branch on the device, so the two have to agree on every
-# value from one identity key or its notes do not come back from the nsec.
+# nostr-seed.json is an extension, not LUD-25/26, and says so. heartwood-esp32
+# derives the same tree on the device, so the two have to agree on every value
+# from one identity key or its notes do not come back from the nsec.
 
 
 def test_nostr_seed_is_marked_as_an_extension():
@@ -976,231 +1178,237 @@ def test_nostr_seed_is_marked_as_an_extension():
 )
 def test_nostr_seed(case):
     identity = bytes.fromhex(case["identity"])
+    host, domain = case["host"], case["domain"]
+    assert spend_domain_of(host) == domain
     # the key the lightning address's npub encodes
-    public = PrivateKey(identity).public_key.format(compressed=True)[1:]
-    assert public.hex() == case["identityPubkey"]
+    assert _x_only(identity) == case["identityPubkey"]
 
     seed = derive_nostr_cash_seed(identity)
     assert seed.hex() == case["seed"]
-    node = derive_nostr_address_node(identity, case["host"])
-    assert cash_node_to_hex(node) == case["addressNode"]
-    # nothing but the ordinary address path from that seed
-    plain = derive_cash_address_node(derive_cash_root(seed), case["host"])
-    assert cash_node_to_hex(plain) == case["addressNode"]
-
-    cx1 = cash_node_to_cx1(node)
-    assert encode_cx1(cx1.pubkey_x_only, cx1.chain_code) == case["cx1"]
-    assert decode_cx1(case["cx1"]) == cx1
-    assert spend_domain_of(case["host"]) == case["domain"]
-
-    assert case["notes"]
-    for note in case["notes"]:
-        sk = derive_note_secret_key(
-            node.private_key, node.chain_code, note["index"], note["purpose"]
-        )
-        assert sk.hex() == note["noteSecretKey"]
-        pk = derive_note_pubkey(
-            cx1.pubkey_x_only, cx1.chain_code, note["index"], note["purpose"]
-        )
-        assert pk.hex() == note["notePubkey"]
-        assert encode_cp1(pk) == note["cp1"]
-        _grade_key_path_note(sk, pk, note, case["domain"])
+    root = derive_nostr_service_root(identity, host)
+    assert cash_node_to_hex(root) == case["serviceRoot"]
+    # nothing but LUD-26's tree from that seed
+    assert cash_node_to_hex(derive_service_root(derive_cash_root(seed), host)) == case["serviceRoot"]
+    assert case["accounts"]
+    _grade_accounts(root, case["accounts"], host, domain, host)
 
 
-# ---- LUD-25's own published Test Vectors ----
+# ---- LUD-25 and LUD-26's own published Test Vectors ----
 #
-# spec-vectors.json transcribes 25.md's "Test Vectors" section, so every value
-# here is what the spec document itself publishes, not just this project's own
+# spec-vectors.json transcribes the vector files the specs publish (lnurl/luds
+# 92e430f: 25-vectors.json and 26-vectors.json), so every value here is what
+# the spec documents themselves publish, not just this project's own
 # internally generated fixtures. Checked against the library's real functions.
 
 _SPEC = "spec-vectors.json"
+_CURVE_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 
 
-def _spec_branch(case: dict):
-    root = derive_cash_root(bytes.fromhex(case["seedHex"]))
-    host = case["domain"]
-    assert derive_cash_child(root, 0).private_key.hex() == case["cashHashingKey"]
-    assert list(cash_domain_indices(root, host)) == case["domainIndices"]
-
-    branch = derive_cash_address_node(root, host)
-    assert cash_node_to_hex(branch) == cash_node_to_hex(derive_cash_domain_node(root, host))
-    assert branch.private_key.hex() == case["branchPrivateKey"]
-    assert branch.chain_code.hex() == case["chainCode"]
-
-    cx1 = cash_node_to_cx1(branch)
-    assert cx1.pubkey_x_only.hex() == case["branchPubkeyXOnly"]
-    assert encode_cx1(cx1.pubkey_x_only, cx1.chain_code) == case["cx1"]
-    return branch, cx1
-
-
-@pytest.mark.parametrize("name", ["vector1", "vector2"])
-def test_spec_vector_branch_and_notes(name):
-    case = load_vectors(_SPEC)[name]
-    branch, cx1 = _spec_branch(case)
-    for note in case["notes"]:
-        index, purpose = note["index"], note["purpose"]
-        pk = derive_note_pubkey(cx1.pubkey_x_only, cx1.chain_code, index, purpose)
-        assert pk.hex() == note["pk"], index
-        assert encode_cp1(pk) == note["cp1"], index
-        sk = derive_note_secret_key(branch.private_key, branch.chain_code, index, purpose)
-        assert sk.hex() == note["sk"], index
-        # x(sk_i . G) == pk_i, the round trip 25.md calls out explicitly
-        assert PrivateKey(sk).public_key_xonly.format() == pk, index
-
-
-def test_spec_vector_address_proofs():
-    case = load_vectors(_SPEC)["vector2"]
-    branch, _ = _spec_branch(case)
-    sk0 = derive_note_secret_key(branch.private_key, branch.chain_code, 0)
-    for proof in case["addressProofs"]:
-        action, domain, username = proof["action"], proof["domain"], proof["username"]
-        assert domain == case["domain"]
-        assert address_proof_message(action, domain, username) == proof["message"]
-        assert address_proof_digest(action, domain, username).hex() == proof["digest"]
-        assert sign_address_proof(sk0, action, domain, username).hex() == proof["signature"]
-
-
-def test_spec_vector_ck1():
-    case = load_vectors(_SPEC)["vector3"]
-    sk = bytes.fromhex(case["secretKey"])
-    q = bytes.fromhex(case["Q"])
-    assert PrivateKey(sk).public_key_xonly.format() == q
-    assert encode_cp1(q) == case["cp1"]
-    domain = case["domain"]
-    assert spend_prevout(domain).hex() == case["prevoutTxid"]
-    assert case["spentScriptPubKey"] == "5120" + case["Q"]
+def _grade_spec_key_path_spend(spend: dict, secret: bytes, at: str) -> str:
+    """A key_path_spend vector, both specs' shape. Returns its ck1."""
+    q = bytes.fromhex(spend["Q"])
+    assert PrivateKey(secret).public_key_xonly.format() == q, at
+    assert encode_cp1(q) == spend["cp1"], at
+    domain = spend["domain"]
+    assert spend_prevout(domain).hex() == spend["prevout_txid"], at
+    assert spend["spent_script_pubkey"] == "5120" + spend["Q"], at
     # every SigMsg field, in order, is exactly the whole SigMsg
-    fields = case["sigMsgFields"]
+    fields = spend["sigmsg_fields"]
     order = [
         "hash_type", "nVersion", "nLockTime", "sha_prevouts", "sha_amounts",
         "sha_scriptpubkeys", "sha_sequences", "sha_outputs", "spend_type", "input_index",
     ]
-    assert list(fields) == order
-    assert "".join(fields[name] for name in order) == case["sigMsg"]
+    assert list(fields) == order, at
+    assert "".join(fields[name] for name in order) == spend["sigmsg"], at
     sig_msg = spend_sig_msg(q, domain, 0, 0xFFFFFFFF)
-    assert sig_msg.hex() == case["sigMsg"]
-    assert len(sig_msg) == 174
-    assert key_path_sighash(q, domain).hex() == case["sighash"]
-    assert case["auxRand"] == "00" * 32
-    payload = sign_note_ownership(sk, domain)
-    assert payload[:32] == q
-    assert payload[32:].hex() == case["signature"]
-    assert encode_ck1(payload) == case["ck1"]
+    assert sig_msg.hex() == spend["sigmsg"], at
+    assert len(sig_msg) == 174, at
+    assert key_path_sighash(q, domain).hex() == spend["sighash"], at
+    assert spend["aux_rand"] == "00" * 32, at
+    payload = sign_note_ownership(secret, domain)
+    assert payload[:32] == q, at
+    assert payload[32:].hex() == spend["sig"], at
+    assert encode_ck1(payload) == spend["ck1"], at
     # the canonical spend transaction, serialised here with its witness rather
     # than by the library: version, segwit marker and flag, one input spending
     # (prevout, 0) with an empty scriptSig and a final sequence, one empty
     # zero-value output, the witness [sig], locktime 0
     tx = (
-        "02000000" + "0001" + "01" + case["prevoutTxid"] + "00000000" + "00" + "ffffffff"
-        + "01" + "0000000000000000" + "00" + "01" + "40" + case["signature"] + "00000000"
+        "02000000" + "0001" + "01" + spend["prevout_txid"] + "00000000" + "00" + "ffffffff"
+        + "01" + "0000000000000000" + "00" + "01" + "40" + spend["sig"] + "00000000"
     )
-    assert tx == case["spendTransaction"]
-    assert note_id_of(case["ck1"]) == case["Q"]
-    verified = verify_spend(case["ck1"], domain)
-    assert verified is not None and verified.output_key == q and not verified.legacy
+    assert tx == spend["spend_tx"], at
+    assert note_id_of(spend["ck1"]) == spend["Q"], at
+    verified = verify_spend(spend["ck1"], domain)
+    assert verified is not None and verified.output_key == q and not verified.legacy, at
     # "The same ck1 submitted to a SERVICE on any other domain fails"
-    assert verify_spend(case["ck1"], "cash.example.com") is None
+    assert verify_spend(spend["ck1"], "elsewhere.example") is None, at
+    return spend["ck1"]
 
 
-def test_spec_vector_cs1():
-    case = load_vectors(_SPEC)["vector4"]
-    mint_key = PrivateKey(bytes.fromhex(case["mintPrivateKey"]))
-    assert mint_key.public_key.format(compressed=True).hex() == case["mintPubkey"]
-    pk, other = case["notePubkey"], case["otherNotePubkey"]
-    for cert in case["certificates"]:
-        amount = cert["amountMsat"]
-        assert note_signature_message_for_hash(pk, amount) == cert["message"]
-        digest = note_signature_digest_for_hash(pk, amount)
-        assert digest.hex() == cert["digest"]
+def test_lud25_spec_vectors():
+    v = load_vectors(_SPEC)["lud25"]
+    spend = v["key_path_spend"]
+    ck1 = _grade_spec_key_path_spend(spend, bytes.fromhex(spend["sk"]), "lud25 key_path_spend")
+
+    certificates = v["certificates"]
+    mint_key = PrivateKey(bytes.fromhex(certificates["service_sk"]))
+    mint_pubkey = mint_key.public_key.format(compressed=True).hex()
+    assert mint_pubkey == certificates["mintPubkey"]
+    q, domain = certificates["Q"], certificates["domain"]
+    assert q == spend["Q"]
+    for cert in certificates["cases"]:
+        amount = cert["amount_msat"]
+        assert note_signature_message_for_hash(q, domain, amount) == cert["message"], amount
+        digest = note_signature_digest_for_hash(q, domain, amount)
+        assert digest.hex() == cert["digest"], amount
         signature = mint_key.sign_recoverable(digest, hasher=None)
-        assert signature.hex() == cert["signature"]
-        assert encode_cs1_with_amount(amount, signature) == cert["cs1"]
+        assert signature.hex() == cert["signature"], amount
+        cs1 = encode_cs1_with_amount(amount, signature)
+        assert cs1 == cert["cs1"], amount
+        assert verify_note_signature_hash(q, domain, amount, cs1, mint_pubkey), amount
+        cp1 = encode_cp1(bytes.fromhex(q))
         assert (
-            verify_note_signature_for_key(pk, amount, cert["signature"], case["mintPubkey"])
+            check_note_certificate(cp1, domain, amount, cs1, mint_pubkey)
             is Certification.CERTIFIED_OVER_Q
         )
-        assert not verify_note_signature_for_key(
-            other, amount, cert["signature"], case["mintPubkey"]
-        )
+        assert (
+            verify_note_signature(ck1, spend["domain"], amount, cs1, mint_pubkey)
+            is Certification.CERTIFIED_OVER_Q
+        ), amount
+        assert not verify_note_signature(ck1, "moneyer.dev", amount, cs1, mint_pubkey), amount
 
-
-def test_spec_vector_bearer_note():
-    case = load_vectors(_SPEC)["vector5"]
-    preimage = bytes.fromhex(case["preimage"])
+    # a bearer note, from preimage to cw1 and its certificate
+    b = v["bearer_note"]
+    preimage = bytes.fromhex(b["preimage"])
     h = hashlib.sha256(preimage).digest()
-    assert h.hex() == case["h"]
+    assert h.hex() == b["h"] and hash_k1(b["preimage"]) == b["h"]
     leaf = bearer_leaf(h)
-    assert leaf.hex() == case["leaf"]
+    assert leaf.hex() == b["leaf"]
     leaf_hash = tap_leaf_hash(leaf)
-    assert leaf_hash.hex() == case["tapleafHash"]
-    assert NUMS_KEY.hex() == case["H"]
+    assert leaf_hash.hex() == b["tapleaf_hash"]
+    assert NUMS_KEY.hex() == b["H"]
     # t, independently: tagged_hash("TapTweak", H || tapleaf_hash)
     tag = hashlib.sha256(b"TapTweak").digest()
-    assert hashlib.sha256(tag + tag + NUMS_KEY + leaf_hash).hexdigest() == case["t"]
+    assert hashlib.sha256(tag + tag + NUMS_KEY + leaf_hash).hexdigest() == b["tweak"]
     note = bearer_note(h)
-    assert note.output_key.hex() == case["Q"]
-    assert note.control_block.hex() == case["controlBlock"]
-    assert encode_cp1(note.output_key) == case["cp1"]
-    assert bearer_note_id(case["h"]) == case["Q"]
-    assert bearer_cw1(case["preimage"]) == case["cw1"]
-    # the preimage and the full cw1 are the same spend, at any domain
-    for spend in (case["preimage"], case["cw1"]):
-        for domain in ("mint.example", "cash.example.com"):
-            verified = verify_spend(spend, domain)
+    assert note.output_key.hex() == b["Q"]
+    assert note.control_block.hex() == b["control_block"]
+    assert encode_cp1(note.output_key) == b["cp1"]
+    # "the hex h and cp1<Q> name the same note"
+    assert bearer_note_id(b["h"]) == b["Q"]
+    assert bearer_cw1(b["preimage"]) == b["cw1"]
+    # "the hex preimage and the full cw1 are the same spend", and open Q at any
+    # domain, since the leaf checks no signature
+    for spend_k1 in (b["preimage"], b["cw1"]):
+        for spend_domain in ("mint.example", "moneyer.dev"):
+            verified = verify_spend(spend_k1, spend_domain)
             assert verified is not None and verified.output_key == note.output_key
             assert not verified.legacy and not verified.unevaluated
-        assert note_id_of(spend) == case["Q"]
+        assert note_id_of(spend_k1) == b["Q"]
+    assert note_lookup_of(b["preimage"]) == b["h"]
+    assert note_lookup_of(b["cw1"]) == b["cp1"]
 
-    cert = case["certificate"]
-    amount = cert["amountMsat"]
-    assert note_signature_message_for_hash(case["Q"], amount) == cert["message"]
-    assert note_signature_message(case["preimage"], amount) == cert["message"]
-    assert note_signature_digest_for_hash(case["Q"], amount).hex() == cert["digest"]
-    signature = bytes.fromhex(cert["signature"])
-    assert encode_cs1_with_amount(amount, signature) == cert["cs1"]
-    recovered = PublicKey.from_signature_and_message(
-        signature, bytes.fromhex(cert["digest"]), hasher=None
-    )
-    assert recovered.format(compressed=True).hex() == case["mintPubkey"]
-    for spend in (case["preimage"], case["cw1"]):
+    cert = b["certificate"]
+    amount = cert["amount_msat"]
+    url = b["note_url"]
+    domain = spend_domain_of(url)
+    assert note_signature_message(b["preimage"], url, amount) == cert["message"]
+    digest = note_signature_digest(b["preimage"], url, amount)
+    assert digest.hex() == cert["digest"]
+    signature = mint_key.sign_recoverable(digest, hasher=None)
+    assert signature.hex() == cert["signature"]
+    cs1 = encode_cs1_with_amount(amount, signature)
+    assert cs1 == cert["cs1"]
+    for spend_k1 in (b["preimage"], b["cw1"]):
         assert (
-            verify_note_signature(spend, "mint.example", amount, cert["cs1"], case["mintPubkey"])
+            verify_note_signature(spend_k1, domain, amount, cs1, mint_pubkey)
             is Certification.CERTIFIED_OVER_Q
         )
-    assert (
-        verify_note_signature_hash(case["h"], amount, cert["cs1"], case["mintPubkey"])
-        is Certification.CERTIFIED_OVER_Q
-    )
+        # the spend opens Q anywhere, but the certificate names one mint
+        assert not verify_note_signature(spend_k1, "moneyer.dev", amount, cs1, mint_pubkey)
+    for reference in (b["h"], b["cp1"]):
+        assert (
+            check_note_certificate(reference, domain, amount, cs1, mint_pubkey)
+            is Certification.CERTIFIED_OVER_Q
+        ), reference
     # the certified note, in short form, checked from its URL alone
-    assert verify_note_url(case["certifiedNoteUrl"], case["mintPubkey"]) == (
-        amount,
-        Certification.CERTIFIED_OVER_Q,
-    )
-    assert resolve_note_input(case["certifiedNoteUrl"]) is not None
+    assert note_declared_amount(url) == amount
+    assert verify_note_url(url, mint_pubkey) == (amount, Certification.CERTIFIED_OVER_Q)
+    assert resolve_note_input(url) is not None
 
 
-def test_an_independent_wallet_derives_the_same_literal_path():
-    # Taken from lnurl-wallet itself rather than generated by the conformance
-    # suite: a BIP39 phrase (no passphrase) and the branch and first note key
-    # that wallet derives for one real mint host on the literal m/139'/d1..d4.
-    seed = _bip39_seed(
-        "dragon spell warfare girl patrol false erase surprise satisfy lucky curious ill"
-    )
-    assert seed.hex() == (
-        "1c77403f77e0c9c558fa00cdea65ec5c5b7eb9bd10880219b9f5d8fa259aad14"
-        "a81e9ad409641fd61ba3024de788cd88a1f0a27f0ff0a1a8ae140bd17bc3ee5c"
-    )
-    node = derive_cash_address_node(derive_cash_root(seed), "mint.lnurlcash.com")
-    assert node.private_key.hex() == (
-        "ec94d2f4f89e8ea4f4335970e9a7781e30b4223eb405b070f9e3930afccbdc9b"
-    )
-    assert node.chain_code.hex() == (
-        "62ba198d1cf6f086f85f867aff7f8d6845a65dd93152df219f1815d1f707bc99"
-    )
-    cx1 = cash_node_to_cx1(node)
-    # the branch is that wallet's own; the note key is recomputed for the
-    # purpose-aware tweak of luds 50d740a (purpose 0, index 0) with hashlib and
-    # coincurve alone, since the wallet's own first key predates purposes
-    assert derive_note_pubkey(cx1.pubkey_x_only, cx1.chain_code, 0, 0).hex() == (
-        "be5f31ff0b2bc0329961bcb08722b3033ab77a8bb35c776236a15d35afd911ab"
-    )
+def test_lud26_spec_vectors():
+    v = load_vectors(_SPEC)["lud26"]
+    service_roots = []
+    for dv in v["derivation"]:
+        domain = dv["domain"]
+        seed = bytes.fromhex(dv["seed"])
+        root = derive_cash_root(seed)
+        assert derive_cash_child(root, 0).private_key.hex() == dv["cashHashingKey"], domain
+        assert list(cash_domain_indices(root, domain)) == dv["d"], domain
+        service_root = derive_service_root(root, domain)
+
+        def grade(path: NotePath, note: dict, at: str) -> None:
+            key = derive_note_key(service_root, path)
+            assert key.secret_key.hex() == note["sk"], at
+            assert key.pubkey.hex() == note["pk"], at
+            assert key.output_key.hex() == note["Q"], at
+            assert encode_cp1(key.output_key) == note["cp1"], at
+
+        for account in dv["accounts"]:
+            a = account["account"]
+            for note in account["wallet"]["notes"]:
+                grade(NotePath.wallet(a, note["i"]), note, f"{domain} {a}'/0/{note['i']}")
+            for note in account["change"]["notes"]:
+                grade(NotePath.change(a, note["i"]), note, f"{domain} {a}'/1/{note['i']}")
+            for share in account["shareable"]:
+                n = share["share"]
+                at = f"{domain} {a}'/2/{n}'"
+                node = derive_share_node(service_root, a, n)
+                assert node.private_key.hex() == share["p"], at
+                assert node.chain_code.hex() == share["chaincode"], at
+                cx1 = cash_node_to_cx1(node)
+                assert cx1.pubkey.hex() == share["P"], at
+                assert encode_cx1(cx1) == share["cx1"], at
+                watched = decode_cx1(share["cx1"])
+                assert watched == cx1, at
+                for note in share["notes"]:
+                    i = note["i"]
+                    grade(NotePath.for_share(a, n, i), note, f"{at}/{i}")
+                    assert derive_note_pubkey(watched, i).hex() == note["Q"], f"{at}/{i}: CKDpub"
+        service_roots.append(service_root)
+
+    # a key-path spend of an odd-y note: the signer negates the key
+    spend = v["key_path_spend"]
+    first = v["derivation"][0]["accounts"][0]["wallet"]["notes"][0]
+    assert spend["path"] == first["path"]
+    key = derive_note_key(service_roots[0], NotePath.wallet(0, 0))
+    assert key.secret_key.hex() == spend["sk"]
+    assert key.pubkey.hex() == spend["pk"]
+    assert key.pubkey[0] == 0x03, "the vector's note has odd y"
+    negated = (_CURVE_N - int.from_bytes(key.secret_key, "big")).to_bytes(32, "big")
+    assert negated.hex() == spend["signing_sk"]
+    _grade_spec_key_path_spend(spend, key.secret_key, "lud26 key_path_spend")
+
+    # register share 0, update to share 1, unregister with share 1
+    r = v["registration"]
+    domain, username = r["domain"], r["username"]
+    assert domain == v["derivation"][1]["domain"]
+    account = v["derivation"][1]["accounts"][0]
+    old = derive_share_node(service_roots[1], 0, 0)
+    new = derive_share_node(service_roots[1], 0, 1)
+    cx1, new_cx1 = r["cx1"], r["new_cx1"]
+    assert cx1 == account["shareable"][0]["cx1"]
+    assert new_cx1 == account["shareable"][1]["cx1"]
+    for proof, action, bound, signer, signer_cx1 in (
+        (r["register"], "register", cx1, old, cx1),
+        (r["update"]["sig"], "update", new_cx1, old, cx1),
+        (r["update"]["newsig"], "register", new_cx1, new, new_cx1),
+        (r["unregister"], "unregister", None, new, new_cx1),
+    ):
+        assert address_proof_message(action, domain, username, bound) == proof["message"], action
+        assert address_proof_digest(action, domain, username, bound).hex() == proof["digest"]
+        signature = sign_address_proof(signer.private_key, action, domain, username, bound)
+        assert signature.hex() == proof["sig"], action
+        assert verify_address_proof(signer_cx1, signature, action, domain, username, bound), action

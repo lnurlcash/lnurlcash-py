@@ -30,8 +30,9 @@ from .errors import (
 from .fees import _MAX_SAFE_INT, MintFee, parse_mint_fee
 from .bolt11 import decode_bolt11_amount_msat
 from .note import note_k1
-from .recoverable import is_cp1, verify_spend
+from .recoverable import decode_spend, is_cp1, verify_spend
 from .secrets import generate_note_secret, hash_k1, is_preimage
+from .spend import spend_domain_of
 from .urls import is_allowed_service_url
 
 
@@ -651,6 +652,57 @@ def melt_request(callback: str, k1: str, pr: str) -> Request:
         )
 
     return Request(url=url, parse=parse)
+
+
+def internal_transfer_request(
+    pay_request: PayRequestInfo, note_domain: str, k1: str, amount_msat: int
+) -> Request:
+    """LUD-26's internal transfer: pay a Lightning Address at the note's own
+    mint with the note itself, by sending its spend to the address's payRequest
+    ``callback`` instead of asking for an invoice. The SERVICE burns the note
+    and credits its full value, free of fees, to the payee's next share key,
+    which the payer never learns.
+
+    ``amount_msat`` MUST be the note's full value (``maxWithdrawable`` from its
+    informational GET), within the payRequest's sendable range: to pay part of
+    a note, split off the exact amount first.
+
+    Refused, before anything is sent, unless the payRequest's ``withdrawLink``
+    is on ``note_domain`` (the note URL, or the mint it lives at). Anywhere
+    else this hands a bearer secret to a SERVICE that does not hold the note.
+    Parse the answer with :func:`parse_internal_transfer`.
+    """
+    try:
+        same_mint = (
+            pay_request.withdraw_link is not None
+            and spend_domain_of(pay_request.withdraw_link) == spend_domain_of(note_domain)
+        )
+    except ProtocolError:
+        same_mint = False
+    if not same_mint:
+        raise RequestRefused(
+            "That Lightning Address is not at the note's mint, so the note cannot "
+            "be sent to it - pay it over Lightning instead."
+        )
+    if (
+        isinstance(amount_msat, bool)
+        or not isinstance(amount_msat, int)
+        or amount_msat < pay_request.min_sendable
+        or amount_msat > pay_request.max_sendable
+    ):
+        raise RequestRefused(
+            f"{amount_msat} msat is outside what that address accepts - split the note first."
+        )
+    if decode_spend(k1) is None:
+        raise RequestRefused("That k1 is no spend.")
+    url = _callback(pay_request.callback, [("amount", str(amount_msat)), ("k1", k1.strip())])
+    return Request(url=url, parse=parse_internal_transfer)
+
+
+def parse_internal_transfer(body: Any) -> None:
+    """The answer to an :func:`internal_transfer_request`. Anything but a clear
+    ``OK`` or a clear refusal is ambiguous: the note may already be burned."""
+    _parse_success(body)
 
 
 def _output_param(value: str, which: int) -> tuple[str, str]:

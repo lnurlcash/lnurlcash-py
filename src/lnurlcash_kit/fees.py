@@ -1,19 +1,31 @@
-"""LUD-25 mint fees (optional).
+"""LUD-25 mint fees (optional), and LUD-26's address fee.
 
-A SERVICE signals what it withholds on minting via an extra
-``["text/plain", "Mint fees: <base_fee_msat>,<fee_percent_ppm>"]`` entry in a
-payRequest's metadata, so a WALLET can warn the payer up front that the note
-they end up holding is worth less than the invoice they paid. A SERVICE that
-omits the entry is fee-free, not unknown.
+A SERVICE signals what it withholds on minting with a
+``Mint fees: <base_fee_msat>,<fee_ppm>`` token anywhere in its payRequest's
+``text/plain`` metadata entry, so a WALLET can warn the payer up front that the
+note they end up holding is worth less than the invoice they paid. The values
+are plain base-10 integers separated by commas, ending at whitespace or the end
+of the entry. A third value is LUD-26's address fee, what registering one
+Lightning Address costs. A SERVICE without the token is fee-free, not unknown.
 """
 
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 
-_FEE_RE = re.compile(r"^Mint fees:\s*(\d+)\s*,\s*(\d+)\s*$")
+
+@dataclass(frozen=True)
+class MintFee:
+    base_fee_msat: int
+    fee_ppm: int
+    #: LUD-26's third value: the fee per Lightning Address registration. None
+    #: when it is not advertised, or does not parse; either way a WALLET should
+    #: refuse to pay a registration invoice it was not told about.
+    address_fee_msat: int | None = None
+
+
+_TOKEN = "Mint fees:"
 
 #: The digits come from a SERVICE and are unbounded in length. Python would
 #: carry any of them exactly, but the shared vectors refuse anything past
@@ -22,13 +34,42 @@ _FEE_RE = re.compile(r"^Mint fees:\s*(\d+)\s*,\s*(\d+)\s*$")
 _MAX_SAFE_INT = 2**53 - 1
 
 
-@dataclass(frozen=True)
-class MintFee:
-    base_fee_msat: int
-    fee_ppm: int
+def _value_of(text: str) -> int | None:
+    if not text or not text.isascii() or not text.isdigit():
+        return None
+    value = int(text)
+    return value if value <= _MAX_SAFE_INT else None
+
+
+def _parse_token(text: str) -> MintFee | None:
+    """The token's values: after ``Mint fees:`` and any spaces, up to the next
+    whitespace. None when the first two do not parse, which LUD-25 calls an
+    unknown fee: a WALLET relies on ``maxWithdrawable`` alone."""
+    at = text.find(_TOKEN)
+    if at < 0:
+        return None
+    rest = text[at + len(_TOKEN) :].lstrip()
+    values = rest.split(None, 1)[0] if rest else ""
+    parts = values.split(",")
+    base_fee_msat = _value_of(parts[0])
+    fee_ppm = _value_of(parts[1]) if len(parts) > 1 else None
+    if base_fee_msat is None or fee_ppm is None:
+        return None
+    # A fee of 100% or more can never net anything. Refusing it here is also
+    # what keeps gross_up_for_mint_fee's search bounded, so a SERVICE cannot
+    # stall a caller simply by advertising one.
+    if fee_ppm >= 1_000_000:
+        return None
+    address_fee_msat = _value_of(parts[2]) if len(parts) > 2 else None
+    return MintFee(base_fee_msat, fee_ppm, address_fee_msat)
 
 
 def parse_mint_fee(metadata: str) -> MintFee | None:
+    """The first parseable ``Mint fees`` token in a payRequest's ``text/plain``
+    entries. None when there is none, which is fee-free, when it does not
+    parse, which is a fee the WALLET does not know, and when every value is
+    zero, so a caller never has to special-case a fee that withholds nothing.
+    ``Mint fees: 0,0,21000`` is an address fee alone."""
     try:
         entries = json.loads(metadata)
     except (json.JSONDecodeError, TypeError):
@@ -40,24 +81,12 @@ def parse_mint_fee(metadata: str) -> MintFee | None:
             continue
         if not isinstance(entry[1], str):
             continue
-        match = _FEE_RE.match(entry[1])
-        if not match:
+        fee = _parse_token(entry[1])
+        if fee is None:
             continue
-        base_fee_msat = int(match.group(1))
-        fee_ppm = int(match.group(2))
-        if base_fee_msat > _MAX_SAFE_INT or fee_ppm > _MAX_SAFE_INT:
-            continue
-        # A fee of 100% or more can never net anything. Refusing it here is
-        # also what keeps gross_up_for_mint_fee's search bounded, so a SERVICE
-        # cannot stall a caller simply by advertising one.
-        if fee_ppm >= 1_000_000:
-            continue
-        # An explicit "Mint fees: 0,0" has exactly the effect of omitting the
-        # entry - treat it identically, so callers never have to special-case
-        # a fee that is present but withholds nothing.
-        if base_fee_msat == 0 and fee_ppm == 0:
+        if fee.base_fee_msat == 0 and fee.fee_ppm == 0 and not fee.address_fee_msat:
             return None
-        return MintFee(base_fee_msat=base_fee_msat, fee_ppm=fee_ppm)
+        return fee
     return None
 
 
