@@ -176,28 +176,40 @@ invoice. First rotater wins.
 
 ## Seed derivation
 
-LUD-25 derives a per-mint branch of note keys from the wallet seed, and this
-library implements the specified path:
+LUD-26 derives every key-path note with plain BIP-32. Each SERVICE gets its own
+root `S`, found with LUD-05's domain-hashing steps under a purpose of its own:
 
 ```
 cashHashingKey   = m/139'/0
-(d1, d2, d3, d4) = HMAC-SHA256(cashHashingKey, host)[0..16] as 4 uint32
-branch           = m/139'/d1/d2/d3/d4
+(d1, d2, d3, d4) = HMAC-SHA256(cashHashingKey, domain)[0..16] as 4 uint32
+S                = m/139'/d1/d2/d3/d4
 ```
 
 `d1..d4` are used **exactly as they fall**. BIP-32 reads any index `>= 2^31`
 as hardened, so which of the four levels are hardened is decided by the mint's
-own host name. Masking the top bit, or hardening all four, derives a different
-tree and restores nothing, silently.
+own domain. Masking the top bit, or hardening all four, derives a different
+tree and restores nothing, silently. `domain` is the string every signature at
+that mint commits to: the full hostname, lowercased, with no scheme or port.
 
-```python
-root = derive_cash_root(seed)                   # m/139'
-node = derive_cash_domain_node(root, host)      # m/139'/d1/d2/d3/d4
+Below `S` the layout is BIP-44's `account'/chain/index`, with a third chain
+for keys that may be shared:
+
+```
+S/a'/0/i       wallet:  every note the wallet mints, rotates or merges into, and a split's p1
+S/a'/1/i       change:  a split's p2
+S/a'/2/n'      share n, exported as its cx1
+S/a'/2/n'/i    note i of share n, credited by the SERVICE
 ```
 
-That node is the address branch of key-path notes (`derive_cash_address_node`
-returns the same one). Whoever holds it can derive every note key held at that
-mint - provisioning material, one mint's subtree, not the wallet.
+A note's secret key is the BIP-32 private key at its path and its `Q` is
+`x(sk * G)`. Accounts and shares are hardened; a note index is below `2^31`.
+
+```python
+root = derive_cash_root(seed)                       # m/139'
+s = derive_service_root(root, "mint.example")       # S, from a domain, URL or host
+key = derive_note_key(s, NotePath.wallet(0, i))     # NoteKey(secret_key, pubkey, output_key)
+share = derive_share_node(s, 0, n)                  # S/0'/2/n', hand out its cx1 only
+```
 
 Bearer preimages are plain randomness, as LUD-25 says. They are not derived
 from the seed, so back them up by other means or rotate them into a key.
@@ -207,6 +219,17 @@ project shipped before the draft had one. Not deprecated, because notes minted
 under it are still money; just not what to mint under.
 `note_info_by_hash_request` is the private lookup a restore walk should use:
 asking by secret publishes the very secret being checked.
+
+### The superseded tweak, read only
+
+Before LUD-26 (luds `a6c4652`) note keys were tweaked off one node,
+`m/139'/d1/d2/d3/d4` over the host as stored (port included), with a 64-byte
+`cx1`. Notes minted that way are still money, so `legacy_branch_node`,
+`legacy_cx1_of`, `legacy_derive_note_pubkey` and `legacy_derive_note_secret_key`
+reproduce those keys, for finding and sweeping them into LUD-26 keys. The
+purpose is `LEGACY_PURPOSE_WALLET` (0), `LEGACY_PURPOSE_CHANGE` (1),
+`LEGACY_PURPOSE_LIGHTNING_ADDRESS` (2), or `None` for the scheme before
+purposes. Nothing new is ever derived or registered this way.
 
 ## Notes, spends and certificates
 
@@ -235,26 +258,21 @@ lowercase hostname (`spend_domain_of`):
 
 ```python
 from lnurlcash_kit import (
-    cash_node_to_cx1, derive_cash_address_node, derive_cash_root,
-    derive_note_pubkey, derive_note_secret_key, encode_ck1, encode_cp1,
-    encode_cx1, sign_note_ownership, PURPOSE_WALLET,
+    NotePath, cash_node_to_cx1, decode_cx1, derive_cash_root, derive_note_key,
+    derive_note_pubkey, derive_service_root, derive_share_node, encode_ck1,
+    encode_cp1, encode_cx1, sign_note_ownership,
 )
 
-node = derive_cash_address_node(derive_cash_root(seed), "mint.example")
-branch = cash_node_to_cx1(node)
-watch_only = encode_cx1(branch.pubkey_x_only, branch.chain_code)
+s = derive_service_root(derive_cash_root(seed), "mint.example")
+key = derive_note_key(s, NotePath.wallet(0, i))
+ck1 = encode_ck1(sign_note_ownership(key.secret_key, "mint.example"))  # spends at mint.example only
 
-pk = derive_note_pubkey(branch.pubkey_x_only, branch.chain_code, i, PURPOSE_WALLET)  # Q, used as is
-sk = derive_note_secret_key(node.private_key, node.chain_code, i, PURPOSE_WALLET)
-ck1 = encode_ck1(sign_note_ownership(sk, "mint.example"))           # spends at mint.example only
+# a share is a watch-only export: 65 bytes, chain code then compressed point
+share = derive_share_node(s, 0, n)
+cx1 = encode_cx1(cash_node_to_cx1(share))                  # 113 characters
+q = derive_note_pubkey(decode_cx1(cx1), j)                 # CKDpub, what a mint credits
 
-# purpose splits the branch into three counters: PURPOSE_WALLET (0: notes the
-# wallet mints, rotates or merges into, and a split's p1), PURPOSE_CHANGE (1: a
-# split's change, p2) and PURPOSE_LIGHTNING_ADDRESS (2: notes a mint credits by
-# Lightning Address auto-mint or internal transfer). Scan each on recovery.
-# t = tagged_hash("LNURLcash/derive", P || chaincode || ser32(purpose) || ser32(i))
-
-client.rotate_note_with_hash(callback, ck1, encode_cp1(next_pk))     # sent as p1; its cs1 is owed
+client.rotate_note_with_hash(callback, ck1, encode_cp1(key.output_key))  # sent as p1; its cs1 is owed
 ```
 
 All-zero `aux_rand` makes a `ck1` a deterministic function of the key and the
@@ -274,8 +292,9 @@ witness, and its time claim against its own clock (`check_time_claim`
 predicts the answer).
 
 A certificate, `cs1…`, carries the amount in its prefix by BOLT 11 amount
-rules and signs `LNURLcash:<amount_msat>:<hex(Q)>`. A recipient checks a note
-offline from its URL alone:
+rules and signs `LNURLcash:<domain>:<amount_msat>:<hex(Q)>`, so it names the
+one mint on that domain. The recovery id is last, 0 to 3. A recipient checks a
+note offline from its URL alone:
 
 ```python
 amount, certified = verify_note_url(note_url, mint_pubkey)
@@ -284,13 +303,16 @@ certified = verify_note_signature(k1, note_url, amount_msat, cs1, mint_pubkey)
 ```
 
 Both return a `Certification`: `CERTIFIED_OVER_Q`, as LUD-25 specifies;
+`CERTIFIED_OVER_LEGACY_Q` for a certificate over `hex(Q)` with no domain, as
+mints signed before luds `92abbb3` (a mint should re-issue `c`);
 `CERTIFIED_OVER_HASH` for a bearer note certified over its `h` by a mint from
 before notes were keyed by `Q`; or `NOT_CERTIFIED`, the only falsy one.
 `verify_note_signature` checks that `k1` opens its note at the URL's domain
-first. `verify_note_signature_hash` takes a bearer note's `h` instead, and
-`verify_note_signature_for_key` a `hex(Q)`, for a watcher that holds no
-spend. A certificate proves issuance, not that the note is still outstanding:
-rotate a received note once online.
+first. For a watcher that holds no spend, `check_note_certificate` takes a
+`cp1` or a bearer `h`, and `verify_note_signature_hash` a `hex(Q)` (current
+certificates only, as a `bool`); `verify_legacy_note_signature_hash` reads the
+old messages. A certificate proves issuance, not that the note is still
+outstanding: rotate a received note once online.
 
 `encode_cs1_with_amount`, `decode_cs1_with_amount` and `is_cs1_with_amount`
 are the current wire API; the fixed-prefix `encode_cs1`, `decode_cs1` and
@@ -303,41 +325,61 @@ and as the comment on a mint invoice (a bearer `h` also as `h`, for mints that
 took that parameter first). A `cp1` whose key is not a curve point is refused
 before anything is sent.
 
-Reference-mint address management proves control with the address branch's
-purpose-0 index-0 key. `sign_address_proof(sk0, action, domain, username)` returns the
-raw 64-byte BIP-340 proof over
-`sha256("LNURLcash:<action>:<domain>:<username>")`; action is `register` or
-`unregister`, the domain is the mint's own, and the username must be
-normalised exactly as it is sent to the service.
+A registered Lightning Address (LUD-26) is proved by the share's own key, a
+BIP-340 signature over `sha256` of one of
+
+```
+LNURLcash:register:<domain>:<username>:<cx1>
+LNURLcash:update:<domain>:<username>:<new cx1>
+LNURLcash:unregister:<domain>:<username>
+```
+
+The username is lowercased; the `cx1` binds the proof to the share it puts on
+file, and the domain to the one SERVICE. `address_proof_message`,
+`address_proof_digest` and `sign_address_proof(share_secret_key, action,
+domain, username, cx1)` build and sign them, and `verify_address_proof` is the
+SERVICE's check against `x(P)` of the signer's `cx1`. An update's PUT carries
+an `update` proof by the key on file and a `register` proof by the new share.
+
+A mint's third `Mint fees` value is LUD-26's address fee:
+`parse_mint_fee` returns it as `MintFee.address_fee_msat`, and `Mint fees:
+0,0,21000` is an address fee alone. To pay a Lightning Address at the note's own
+mint with the note itself, `internal_transfer_request(pay_request, note_domain,
+k1, amount_msat)` builds the callback request (refused unless the address's
+`withdrawLink` is on the note's domain) and `parse_internal_transfer` reads the
+answer.
 
 Three things worth knowing:
 
-- **The branch path is the spec's literal one.** It is `m/139'/d1/d2/d3/d4`,
-  with the hashing key at `m/139'/0`: the same node `derive_cash_domain_node`
-  returns. Wallets that derived under the earlier `m/139'/1'` hop hold notes
-  this path does not find.
-- **A `cx1` links every note on its branch.** It cannot spend anything, but
-  whoever holds it can list every key on the branch and ask the mint about
-  each one. Register it with a mint and that mint sees everything paid to the
-  address. Use the branch for receiving and rotate off it.
+- **The root is the spec's literal path.** `S` is `m/139'/d1/d2/d3/d4` over
+  the domain, with the hashing key at `m/139'/0`. A host with a port derives
+  from its bare hostname now; a wallet that hashed `localhost:3338` before
+  sees a different tree, and `legacy_branch_node` still reaches the old one.
+- **A `cx1` links every note on its share.** It cannot spend anything, but
+  whoever holds it can list every key on the share and ask the mint about
+  each one. Register one with a mint and that mint sees everything paid to the
+  address. Use a fresh share for every party, and rotate received notes into
+  wallet notes promptly: a leaked note key together with its `cx1` exposes
+  every other note still on that share.
 - **Compare notes by `note_id_of`, never by the string.** `fetch_note_info`
   does: a mint that echoes another spend of the same note, valid at that
   mint, has named that note, and only a different note is refused.
 
-**A branch rooted in a Nostr key.** This one is ours, not LUD-25's. A holder
+**A tree rooted in a Nostr key.** This one is ours, not LUD-25's. A holder
 with no BIP-39 words, such as a hardware signer that keeps only its identity
-key, can still be paid to keys of its own. `derive_nostr_address_node(secret_key,
-host)` takes the branch from the key behind the lightning address's npub:
-`HMAC-SHA256(key = secret key, msg = "LNURLcash/nostr-seed")`, then the path
-above unchanged. heartwood-esp32 derives the same branch on the device, so its
-notes come back from the nsec without the device. A mint sees an ordinary
+key, can still be paid to keys of its own. `derive_nostr_service_root(secret_key,
+domain)` takes `S` from the key behind the lightning address's npub:
+`HMAC-SHA256(key = secret key, msg = "LNURLcash/nostr-seed")`, then LUD-26's
+tree above unchanged. heartwood-esp32 derives the same tree on the device, so
+its notes come back from the nsec without the device. A mint sees an ordinary
 `cx1` either way.
 
 Both are graded against lnurlcash-conformance's `vectors/part2.json` and
-`vectors/nostr-seed.json`: every branch, key, signature, certificate and
-string in them. The spends are graded against `vectors/spends.json`, and all
-of it against `vectors/spec-vectors.json`, the numbers LUD-25's own text
-publishes.
+`vectors/nostr-seed.json`: every account, share, key, signature, certificate
+and string in them, and the superseded tweak's keys. The spends are graded
+against `vectors/spends.json`, and all of it against
+`vectors/spec-vectors.json`, the numbers LUD-25's and LUD-26's own vector files
+publish.
 
 ## Errors
 
@@ -346,8 +388,8 @@ publishes.
 | `RequestRefused` | nothing was sent. The note is untouched. |
 | `ServiceRejected` | processed and refused. Definitive. |
 | `NotePending` | a melt is in flight on this `k1`. Retry. |
-| `NoteSpent` | authoritative: already burned. |
-| `OutputInUse` | `already in use`: an output you named is taken. Nothing burned; name a fresh one. |
+| `NoteSpent` | authoritative: already burned. LUD-25's exact `already in use` lands here, since a SERVICE answers a burned note with it; it also refuses an output that is already somebody's note, so `is_already_in_use(err)` matches it in either reading. |
+| `OutputInUse` | lnurl-mint's older `Output already in use.`: an output you named is taken. Nothing burned; name a fresh one. |
 | `NoteUnknown` | the service does not recognise it. |
 | `AmbiguousMint` | outcome **unknown**. Assume nothing. |
 | `AmbiguousMutation` | as above, carrying `.new_secrets`. |
